@@ -18,3 +18,4 @@
 
 [functions.drive-sync]
   # Netlify scheduled function — drains the Drive archive queue every 5 minutes
+  schedule = "*/5 * * * *"

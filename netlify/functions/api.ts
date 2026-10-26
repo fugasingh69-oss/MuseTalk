@@ -11,6 +11,12 @@ const publicUser = (u: Record<string, unknown>) => ({
   lastSeenAt: u.last_seen_at, createdAt: u.created_at,
 })
 
+// Embedded author objects (feed / comments / profile) get the same camelCase shape.
+const pubAuthor = (a: unknown) => {
+  const r = (a ?? {}) as Record<string, unknown>
+  return { id: r.id, username: r.username, isAgent: !!r.is_agent }
+}
+
 async function register(event: Event) {
   const ip = clientIp(event.headers)
   if (!(await rateLimit(`register:${ip}`, 5, 3600))) throw new HttpError(429, 'Too many accounts created from this network. Try again later.')
@@ -80,7 +86,7 @@ async function feed(me: string) {
   const liked = new Set((myLikes ?? []).map((l) => l.post_id))
   return json(200, {
     posts: (data ?? []).map((p: Record<string, unknown>) => ({
-      id: p.id, text: p.text, createdAt: p.created_at, author: p.author,
+      id: p.id, text: p.text, createdAt: p.created_at, author: pubAuthor(p.author),
       likeCount: (p.likes as { count: number }[])?.[0]?.count ?? 0,
       commentCount: (p.comments as { count: number }[])?.[0]?.count ?? 0,
       likedByMe: liked.has(p.id as string), mine: (p.author as { id: string }).id === me,
@@ -119,7 +125,7 @@ async function listComments(me: string, postId: string) {
     .eq('post_id', postId).order('created_at', { ascending: true }).limit(300)
   if (hidden.length) q = q.not('author_id', 'in', `(${hidden.join(',')})`)
   const { data } = await q
-  return json(200, { comments: (data ?? []).map((c: Record<string, unknown>) => ({ ...c, mine: (c.author as { id: string }).id === me })) })
+  return json(200, { comments: (data ?? []).map((c: Record<string, unknown>) => ({ ...c, author: pubAuthor(c.author), mine: (c.author as { id: string }).id === me })) })
 }
 
 async function createComment(event: Event, me: string, postId: string) {
@@ -154,16 +160,67 @@ async function profile(me: string, username: string) {
   if (!user) throw new HttpError(404, 'User not found.')
   const hidden = await blockedIds(me)
   if (hidden.includes(user.id)) throw new HttpError(404, 'User not found.')
-  const [{ count: followers }, { count: following }, { data: followRow }, { data: posts }] = await Promise.all([
+  const isMe = user.id === me
+  const authorPub = { id: user.id as string, username: user.username as string, isAgent: !!user.is_agent }
+
+  const [{ count: followers }, { count: following }, { data: followRow }, { data: postRows }, { data: myLikeRows }, { data: commentRows }] = await Promise.all([
     supa.from('follows').select('*', { count: 'exact', head: true }).eq('following_id', user.id),
     supa.from('follows').select('*', { count: 'exact', head: true }).eq('follower_id', user.id),
     supa.from('follows').select('follower_id').eq('follower_id', me).eq('following_id', user.id).maybeSingle(),
     supa.from('posts').select('id, text, created_at, likes(count), comments(count)').eq('author_id', user.id).order('created_at', { ascending: false }).limit(50),
+    supa.from('likes').select('post_id').eq('user_id', me),
+    supa.from('comments').select('id, text, created_at, parent_id, post_id').eq('author_id', user.id).order('created_at', { ascending: false }).limit(50),
   ])
+  const likedSet = new Set((myLikeRows ?? []).map((l) => l.post_id as string))
+  const shapePost = (p: Record<string, unknown>, author: { id: string; username: string; isAgent: boolean }) => ({
+    id: p.id, text: p.text, createdAt: p.created_at, author,
+    likeCount: (p.likes as { count: number }[])?.[0]?.count ?? 0,
+    commentCount: (p.comments as { count: number }[])?.[0]?.count ?? 0,
+    likedByMe: likedSet.has(p.id as string), mine: author.id === me,
+  })
+  const posts = (postRows ?? []).map((p) => shapePost(p as Record<string, unknown>, authorPub))
+
+  // Replies: every comment this user wrote, with the post it belongs to as context.
+  let replies: Record<string, unknown>[] = []
+  const cRows = (commentRows ?? []) as { id: string; text: string; created_at: string; parent_id: string | null; post_id: string }[]
+  if (cRows.length) {
+    const postIds = [...new Set(cRows.map((c) => c.post_id))]
+    const { data: ctxPosts } = await supa.from('posts').select('id, text, author_id').in('id', postIds)
+    const authorIds = [...new Set((ctxPosts ?? []).map((p) => p.author_id as string))]
+    const { data: ctxUsers } = authorIds.length
+      ? await supa.from('users').select('id, username').in('id', authorIds)
+      : { data: [] as { id: string; username: string }[] }
+    const postById = new Map((ctxPosts ?? []).map((p) => [p.id as string, p]))
+    const nameById = new Map((ctxUsers ?? []).map((u) => [u.id as string, u.username as string]))
+    replies = cRows.map((c) => {
+      const post = postById.get(c.post_id)
+      return {
+        id: c.id, text: c.text, createdAt: c.created_at, isReply: !!c.parent_id,
+        postId: c.post_id, postText: (post?.text as string) ?? '', postAuthor: post ? (nameById.get(post.author_id as string) ?? '') : '',
+      }
+    })
+  }
+
+  // Liked posts — returned only on your OWN profile (your likes are yours to revisit).
+  let likedPosts: Record<string, unknown>[] | undefined
+  if (isMe) {
+    likedPosts = []
+    const { data: likeRows } = await supa.from('likes').select('post_id').eq('user_id', me).order('created_at', { ascending: false }).limit(50)
+    const ids = (likeRows ?? []).map((l) => l.post_id as string)
+    if (ids.length) {
+      const { data: liked } = await supa.from('posts')
+        .select('id, text, created_at, author:users!posts_author_id_fkey(id, username, is_agent), likes(count), comments(count)')
+        .in('id', ids)
+      const byId = new Map((liked ?? []).map((p) => [(p as Record<string, unknown>).id as string, p as Record<string, unknown>]))
+      likedPosts = ids.map((id) => byId.get(id)).filter((p): p is Record<string, unknown> => !!p)
+        .map((p) => shapePost(p, pubAuthor(p.author)))
+    }
+  }
+
   return json(200, {
     user: publicUser(user), followers: followers ?? 0, following: following ?? 0,
-    followedByMe: !!followRow, isMe: user.id === me,
-    posts: (posts ?? []).map((p: Record<string, unknown>) => ({ ...p, likeCount: (p.likes as { count: number }[])?.[0]?.count ?? 0, commentCount: (p.comments as { count: number }[])?.[0]?.count ?? 0 })),
+    followedByMe: !!followRow, isMe, posts, replies,
+    ...(likedPosts !== undefined ? { likedPosts } : {}),
   })
 }
 
@@ -308,36 +365,36 @@ export async function handler(event: Event) {
     const seg = path.split('/').filter(Boolean).map(decodeURIComponent)
     const method = event.httpMethod
 
-    if (method === 'POST' && seg[0] === 'register' && seg.length === 1) return register(event)
-    if (method === 'POST' && seg[0] === 'login') return login(event)
-    if (method === 'POST' && seg[0] === 'recover') return recover(event)
+    if (method === 'POST' && seg[0] === 'register' && seg.length === 1) return await register(event)
+    if (method === 'POST' && seg[0] === 'login') return await login(event)
+    if (method === 'POST' && seg[0] === 'recover') return await recover(event)
 
     const me = requireUser(event.headers)
     const supa = db()
     if (method === 'POST' && seg[0] === 'heartbeat') { await supa.from('users').update({ last_seen_at: new Date().toISOString() }).eq('id', me.id); return json(200, { ok: true }) }
     if (method === 'GET' && seg[0] === 'me') { const { data } = await supa.from('users').select('*').eq('id', me.id).single(); return json(200, { user: publicUser(data) }) }
-    if (method === 'PATCH' && seg[0] === 'me') return updateProfile(event, me.id)
+    if (method === 'PATCH' && seg[0] === 'me') return await updateProfile(event, me.id)
 
-    if (method === 'GET' && seg[0] === 'feed') return feed(me.id)
-    if (method === 'POST' && seg[0] === 'posts' && seg.length === 1) return createPost(event, me)
-    if (method === 'DELETE' && seg[0] === 'posts' && seg.length === 2) return deletePost(me.id, seg[1])
-    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'like') return toggleLike(me.id, seg[1])
-    if (method === 'GET' && seg[0] === 'posts' && seg[2] === 'comments') return listComments(me.id, seg[1])
-    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'comments') return createComment(event, me.id, seg[1])
-    if (method === 'DELETE' && seg[0] === 'comments' && seg.length === 2) return deleteComment(me.id, seg[1])
+    if (method === 'GET' && seg[0] === 'feed') return await feed(me.id)
+    if (method === 'POST' && seg[0] === 'posts' && seg.length === 1) return await createPost(event, me)
+    if (method === 'DELETE' && seg[0] === 'posts' && seg.length === 2) return await deletePost(me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'like') return await toggleLike(me.id, seg[1])
+    if (method === 'GET' && seg[0] === 'posts' && seg[2] === 'comments') return await listComments(me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'comments') return await createComment(event, me.id, seg[1])
+    if (method === 'DELETE' && seg[0] === 'comments' && seg.length === 2) return await deleteComment(me.id, seg[1])
 
-    if (method === 'GET' && seg[0] === 'users') return searchUsers(me.id, String(event.queryStringParameters?.q ?? ''))
-    if (method === 'GET' && seg[0] === 'users' && seg.length === 2) return profile(me.id, seg[1])
-    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'follow') return setFollow(me.id, seg[1], true)
-    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'unfollow') return setFollow(me.id, seg[1], false)
-    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'block') return blockOrReport(event, me.id, seg[1], 'block')
-    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'report') return blockOrReport(event, me.id, seg[1], 'report')
+    if (method === 'GET' && seg[0] === 'users' && seg.length === 1) return await searchUsers(me.id, String(event.queryStringParameters?.q ?? ''))
+    if (method === 'GET' && seg[0] === 'users' && seg.length === 2) return await profile(me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'follow') return await setFollow(me.id, seg[1], true)
+    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'unfollow') return await setFollow(me.id, seg[1], false)
+    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'block') return await blockOrReport(event, me.id, seg[1], 'block')
+    if (method === 'POST' && seg[0] === 'users' && seg[2] === 'report') return await blockOrReport(event, me.id, seg[1], 'report')
 
-    if (method === 'GET' && seg[0] === 'conversations' && seg.length === 1) return listConversations(me.id)
-    if (method === 'POST' && seg[0] === 'conversations' && seg.length === 1) return createConversation(event, me.id)
-    if (method === 'GET' && seg[0] === 'conversations' && seg[2] === 'messages') return listMessages(me.id, seg[1], event.queryStringParameters?.before ?? undefined)
-    if (method === 'POST' && seg[0] === 'conversations' && seg[2] === 'messages') return sendMessage(event, me.id, seg[1])
-    if (method === 'POST' && seg[0] === 'conversations' && seg[2] === 'read') return markRead(me.id, seg[1])
+    if (method === 'GET' && seg[0] === 'conversations' && seg.length === 1) return await listConversations(me.id)
+    if (method === 'POST' && seg[0] === 'conversations' && seg.length === 1) return await createConversation(event, me.id)
+    if (method === 'GET' && seg[0] === 'conversations' && seg[2] === 'messages') return await listMessages(me.id, seg[1], event.queryStringParameters?.before ?? undefined)
+    if (method === 'POST' && seg[0] === 'conversations' && seg[2] === 'messages') return await sendMessage(event, me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'conversations' && seg[2] === 'read') return await markRead(me.id, seg[1])
 
     if (method === 'GET' && seg[0] === 'archive-status') {
       const [{ count: pending }, { count: synced }] = await Promise.all([

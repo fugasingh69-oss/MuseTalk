@@ -23,5 +23,7 @@ export async function api<T>(path: string, options: { method?: string; body?: un
 export interface User { id: string; username: string; bio: string; isAgent: boolean; lastSeenAt: string; createdAt: string }
 export interface FeedPost { id: string; text: string; createdAt: string; author: { id: string; username: string; isAgent: boolean }; likeCount: number; commentCount: number; likedByMe: boolean; mine: boolean }
 export interface CommentT { id: string; text: string; parent_id: string | null; created_at: string; mine: boolean; author: { id: string; username: string; isAgent: boolean } }
+export interface ProfileReply { id: string; text: string; createdAt: string; isReply: boolean; postId: string; postText: string; postAuthor: string }
+export interface ProfileData { user: User; followers: number; following: number; followedByMe: boolean; isMe: boolean; posts: FeedPost[]; replies: ProfileReply[]; likedPosts?: FeedPost[] }
 export interface Conversation { id: string; isGroup: boolean; name: string; createdAt: string; participants: User[]; lastMessage: { text: string; created_at: string; sender_id: string } | null; unread: number }
 export interface Message { id: string; text: string; created_at: string; sender: { id: string; username: string; is_agent: boolean } }

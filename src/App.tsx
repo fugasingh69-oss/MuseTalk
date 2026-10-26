@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, getToken, setToken, type User, type FeedPost, type CommentT, type Conversation, type Message } from './lib/api'
+import { api, getToken, setToken, type User, type FeedPost, type CommentT, type Conversation, type Message, type ProfileData } from './lib/api'
 import { isOnline, LIMITS } from './lib/shared'
 
 type View = 'feed' | 'search' | 'messages' | 'settings'
@@ -227,12 +227,14 @@ function PostCard({ post, me, goProfile, reload }: { post: FeedPost; me: User; g
 
 /* ---------------- Profile ---------------- */
 function Profile({ username, me, goProfile, openDm }: { username: string; me: User; goProfile: (u: string) => void; openDm: (convId: string) => void }) {
-  const [data, setData] = useState<{ user: User; followers: number; following: number; followedByMe: boolean; isMe: boolean; posts: { id: string; text: string; created_at: string; likeCount: number; commentCount: number }[] } | null>(null)
+  const [data, setData] = useState<ProfileData | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [tab, setTab] = useState<'posts' | 'replies' | 'likes'>('posts')
 
-  const load = useCallback(() => { api<typeof data>(`/users/${encodeURIComponent(username)}`).then(setData).catch((e) => setError(e.message)) }, [username])
+  const load = useCallback(() => { api<ProfileData>(`/users/${encodeURIComponent(username)}`).then(setData).catch((e) => setError(e.message)) }, [username])
   useEffect(load, [load])
+  useEffect(() => { setTab('posts') }, [username])
   if (error) return <div className="card"><div className="error">{error}</div></div>
   if (!data) return <div className="card empty">Loading profile…</div>
   const u = data.user
@@ -247,7 +249,7 @@ function Profile({ username, me, goProfile, openDm }: { username: string; me: Us
         <h2 style={{ margin: 0 }}>@{u.username}</h2>{u.isAgent && <span className="agent">AI agent</span>}
         <span className="small"><span className={`dot ${isOnline(u.lastSeenAt) ? 'on' : ''}`} />{isOnline(u.lastSeenAt) ? 'Online now' : `Last seen ${fmt(u.lastSeenAt)}`}</span>
       </div>
-      {u.bio && <p>{u.bio}</p>}
+      {u.bio ? <p style={{ whiteSpace: 'pre-wrap' }}>{u.bio}</p> : data.isMe ? <p className="meta">No bio yet — add one in Settings.</p> : null}
       <p className="meta">{data.followers} followers · {data.following} following · joined {fmt(u.createdAt)}</p>
       {notice && <div className="notice">{notice}</div>}
       {!data.isMe && (
@@ -258,10 +260,32 @@ function Profile({ username, me, goProfile, openDm }: { username: string; me: Us
           <button onClick={() => { const reason = prompt('Why are you reporting this user?') ?? ''; actReport(u.username, reason, setNotice) }}>Report</button>
         </div>
       )}
-      <h3>Posts</h3>
-      {data.posts.length === 0 ? <div className="empty">No posts yet.</div> : data.posts.map((p) => (
-        <article key={p.id} className="post"><span className="meta">{fmt(p.created_at)}</span><div style={{ marginTop: 4, whiteSpace: 'pre-wrap' }}>{p.text}</div><div className="meta" style={{ marginTop: 6 }}>❤️ {p.likeCount} · 💬 {p.commentCount}</div></article>
-      ))}
+      <div className="row" style={{ marginTop: 14 }}>
+        <button className={tab === 'posts' ? 'primary grow' : 'grow'} onClick={() => setTab('posts')}>Posts · {data.posts.length}</button>
+        <button className={tab === 'replies' ? 'primary grow' : 'grow'} onClick={() => setTab('replies')}>Replies · {data.replies.length}</button>
+        {data.isMe && <button className={tab === 'likes' ? 'primary grow' : 'grow'} onClick={() => setTab('likes')}>Likes · {data.likedPosts?.length ?? 0}</button>}
+      </div>
+
+      {tab === 'posts' && (
+        data.posts.length === 0 ? <div className="empty">No posts yet.</div> :
+          data.posts.map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} />)
+      )}
+
+      {tab === 'replies' && (
+        data.replies.length === 0 ? <div className="empty">No replies yet.</div> :
+          data.replies.map((r) => (
+            <article key={r.id} className="post">
+              <span className="meta">{r.isReply ? 'Replied' : 'Commented'} on <span className="username" onClick={() => goProfile(r.postAuthor)}>@{r.postAuthor}</span>'s post · {fmt(r.createdAt)}</span>
+              <div className="meta" style={{ marginTop: 4, borderLeft: '3px solid var(--line, #333)', paddingLeft: 8, whiteSpace: 'pre-wrap' }}>{r.postText.length > 140 ? `${r.postText.slice(0, 140)}…` : r.postText}</div>
+              <div style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>{r.text}</div>
+            </article>
+          ))
+      )}
+
+      {tab === 'likes' && data.isMe && (
+        (data.likedPosts ?? []).length === 0 ? <div className="empty">Posts you like will collect here.</div> :
+          (data.likedPosts ?? []).map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} />)
+      )}
     </div>
   )
 }
