@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, getToken, setToken, type User, type FeedPost, type CommentT, type Conversation, type Message, type ProfileData } from './lib/api'
+import { api, getToken, setToken, type User, type FeedPost, type CommentT, type Conversation, type Message, type ProfileData, type NotificationT, type TrendingTag } from './lib/api'
 import { isOnline, LIMITS } from './lib/shared'
 
-type View = 'feed' | 'search' | 'messages' | 'settings'
+type View = 'feed' | 'search' | 'messages' | 'notifications' | 'settings'
 const fmt = (iso: string) => new Date(iso).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 
 export default function App() {
@@ -12,6 +12,9 @@ export default function App() {
   const [profileName, setProfileName] = useState<string | null>(null)
   const [theme, setTheme] = useState(localStorage.getItem('musetalk_theme') ?? 'dark')
   const [totalUnread, setTotalUnread] = useState(0)
+  const [notifUnread, setNotifUnread] = useState(0)
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [searchSeed, setSearchSeed] = useState<{ q: string; mode: 'people' | 'posts'; n: number } | null>(null)
 
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('musetalk_theme', theme) }, [theme])
 
@@ -20,16 +23,29 @@ export default function App() {
     api<{ user: User }>('/me').then((r) => setUser(r.user)).catch(() => setToken(null)).finally(() => setBooting(false))
   }, [])
 
-  // Presence heartbeat + unread badge, only while logged in.
+  // Presence heartbeat + unread badges, only while logged in.
   useEffect(() => {
     if (!user) return
-    const beat = () => { api('/heartbeat', { method: 'POST' }).catch(() => {}); api<{ conversations: Conversation[] }>('/conversations').then((r) => setTotalUnread(r.conversations.reduce((s, c) => s + c.unread, 0))).catch(() => {}) }
+    const beat = () => {
+      api('/heartbeat', { method: 'POST' }).catch(() => {})
+      api<{ conversations: Conversation[] }>('/conversations').then((r) => setTotalUnread(r.conversations.reduce((s, c) => s + c.unread, 0))).catch(() => {})
+      api<{ notifications: NotificationT[] }>('/notifications').then((r) => {
+        const seen = localStorage.getItem('musetalk_notif_seen') ?? ''
+        setNotifUnread(r.notifications.filter((n) => n.createdAt > seen).length)
+      }).catch(() => {})
+    }
     beat()
     const t = setInterval(beat, 30_000)
     return () => clearInterval(t)
   }, [user])
 
   const logout = () => { setToken(null); setUser(null); setView('feed'); setProfileName(null) }
+
+  const goTag = (tag: string) => { setSearchSeed({ q: `#${tag}`, mode: 'posts', n: Date.now() }); setProfileName(null); setView('search') }
+  const openNotifications = () => {
+    setProfileName(null); setView('notifications')
+    localStorage.setItem('musetalk_notif_seen', new Date().toISOString()); setNotifUnread(0)
+  }
 
   if (booting) return <div className="empty">Loading MuseTalk…</div>
   if (!user) return <Landing onAuth={setUser} theme={theme} setTheme={setTheme} />
@@ -39,23 +55,28 @@ export default function App() {
       <header className="topbar"><div className="wrap topbar-in">
         <a className="logo" href="#" onClick={(e) => { e.preventDefault(); setView('feed'); setProfileName(null) }}>Muse<span>Talk</span></a>
         <nav className="nav">
-          <button className={view === 'feed' && !profileName ? 'active' : ''} onClick={() => { setView('feed'); setProfileName(null) }}>Feed</button>
-          <button className={view === 'search' ? 'active' : ''} onClick={() => setView('search')}>Search people</button>
-          <button className={view === 'messages' ? 'active' : ''} onClick={() => setView('messages')}>Messages{totalUnread > 0 && <span className="badge">{totalUnread}</span>}</button>
-          <button onClick={() => setProfileName(user.username)}>@{user.username}</button>
-          <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
+          <button title="Refresh this page's content" onClick={() => setRefreshKey((k) => k + 1)}>⟳ Refresh</button>
+          <button className={view === 'settings' && !profileName ? 'active' : ''} onClick={() => { setView('settings'); setProfileName(null) }}>Settings</button>
           <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? '☀️ Light' : '🌙 Dark'}</button>
           <button onClick={logout}>Log out</button>
         </nav>
       </div></header>
       <main className="wrap layout">
         {profileName
-          ? <Profile username={profileName} me={user} goProfile={setProfileName} openDm={(id) => { setProfileName(null); setView('messages'); sessionStorage.setItem('musetalk_open_conv', id) }} />
-          : view === 'feed' ? <Feed me={user} goProfile={setProfileName} />
-          : view === 'search' ? <Search goProfile={setProfileName} />
-          : view === 'messages' ? <Messages me={user} goProfile={setProfileName} />
+          ? <Profile username={profileName} me={user} goProfile={setProfileName} refreshKey={refreshKey} goTag={goTag} openDm={(id) => { setProfileName(null); setView('messages'); sessionStorage.setItem('musetalk_open_conv', id) }} />
+          : view === 'feed' ? <Feed me={user} goProfile={setProfileName} refreshKey={refreshKey} goTag={goTag} />
+          : view === 'search' ? <Search me={user} goProfile={setProfileName} refreshKey={refreshKey} seed={searchSeed} goTag={goTag} />
+          : view === 'messages' ? <Messages me={user} goProfile={setProfileName} refreshKey={refreshKey} />
+          : view === 'notifications' ? <Notifications me={user} goProfile={setProfileName} refreshKey={refreshKey} />
           : <Settings me={user} setMe={setUser} />}
       </main>
+      <nav className="bottomnav"><div className="wrap bottomnav-in">
+        <button className={view === 'feed' && !profileName ? 'active' : ''} onClick={() => { setView('feed'); setProfileName(null) }}>🏠<span>Feed</span></button>
+        <button className={view === 'search' && !profileName ? 'active' : ''} onClick={() => { setView('search'); setProfileName(null) }}>🔍<span>Search</span></button>
+        <button className={view === 'messages' && !profileName ? 'active' : ''} onClick={() => { setView('messages'); setProfileName(null) }}>✉️<span>Messages</span>{totalUnread > 0 && <span className="badge">{totalUnread}</span>}</button>
+        <button className={view === 'notifications' && !profileName ? 'active' : ''} onClick={openNotifications}>🔔<span>Alerts</span>{notifUnread > 0 && <span className="badge">{notifUnread}</span>}</button>
+        <button className={profileName === user.username ? 'active' : ''} onClick={() => setProfileName(user.username)}>👤<span>Profile</span></button>
+      </div></nav>
     </div>
   )
 }
@@ -141,17 +162,32 @@ function Landing({ onAuth, theme, setTheme }: { onAuth: (u: User) => void; theme
   )
 }
 
+/* ---------------- Rich text (clickable #tags) ---------------- */
+function RichText({ text, goTag }: { text: string; goTag?: (t: string) => void }) {
+  const parts = text.split(/(#[\p{L}\p{N}_]+)/gu)
+  return (
+    <>
+      {parts.map((part, i) => part.startsWith('#') && goTag
+        ? <span key={i} className="taglink" onClick={() => goTag(part.slice(1))}>{part}</span>
+        : <span key={i}>{part}</span>)}
+    </>
+  )
+}
+
 /* ---------------- Feed ---------------- */
-function Feed({ me, goProfile }: { me: User; goProfile: (u: string) => void }) {
+function Feed({ me, goProfile, refreshKey, goTag }: { me: User; goProfile: (u: string) => void; refreshKey: number; goTag: (t: string) => void }) {
   const [posts, setPosts] = useState<FeedPost[]>([])
   const [text, setText] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
+  const [tags, setTags] = useState<TrendingTag[]>([])
 
   const load = useCallback(() => {
     api<{ posts: FeedPost[] }>('/feed').then((r) => setPosts(r.posts)).catch((e) => setError(e.message)).finally(() => setLoading(false))
   }, [])
   useEffect(() => { load(); const t = setInterval(load, 20_000); return () => clearInterval(t) }, [load])
+  useEffect(() => { load() }, [refreshKey, load])
+  useEffect(() => { api<{ tags: TrendingTag[] }>('/trending').then((r) => setTags(r.tags)).catch(() => {}) }, [refreshKey, posts.length])
 
   const publish = async () => {
     if (!text.trim()) return
@@ -164,20 +200,29 @@ function Feed({ me, goProfile }: { me: User; goProfile: (u: string) => void }) {
       {error && <div className="error">{error}</div>}
       <textarea rows={3} maxLength={LIMITS.post} placeholder={`Share something in text, ${me.username}… (${LIMITS.post} characters max)`} value={text} onChange={(e) => setText(e.target.value)} />
       <div className="row" style={{ marginTop: 8 }}><span className="small grow">{text.length}/{LIMITS.post}</span><button className="primary" onClick={publish}>Post</button></div>
+      {tags.length > 0 && (
+        <div className="trendrow">
+          <span className="meta">Trending words:</span>
+          {tags.map((t) => <button key={t.tag} className="tagchip" onClick={() => goTag(t.tag)}>#{t.tag} · {t.count}</button>)}
+        </div>
+      )}
       {loading ? <div className="empty">Loading posts…</div> : posts.length === 0 ? <div className="empty">No posts yet. Be the first to say something.</div> :
-        posts.map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} />)}
+        posts.map((p, i) => <PostCard key={`${p.id}-${p.repostAt ?? ''}-${i}`} post={p} me={me} goProfile={goProfile} reload={load} goTag={goTag} />)}
     </div>
   )
 }
 
-function PostCard({ post, me, goProfile, reload }: { post: FeedPost; me: User; goProfile: (u: string) => void; reload: () => void }) {
+function PostCard({ post, me, goProfile, reload, goTag, isPinnedPost, onPinToggle }: { post: FeedPost; me: User; goProfile: (u: string) => void; reload: () => void; goTag?: (t: string) => void; isPinnedPost?: boolean; onPinToggle?: (p: FeedPost) => void }) {
   const [comments, setComments] = useState<CommentT[] | null>(null)
   const [draft, setDraft] = useState('')
   const [replyTo, setReplyTo] = useState<string | null>(null)
   const [error, setError] = useState('')
+  const [editing, setEditing] = useState(false)
+  const [editText, setEditText] = useState('')
 
   const loadComments = async () => { const r = await api<{ comments: CommentT[] }>(`/posts/${post.id}/comments`); setComments(r.comments) }
   const toggleComments = () => { if (comments) setComments(null); else loadComments().catch((e) => setError(e.message)) }
+  const act = async (fn: () => Promise<unknown>) => { try { await fn(); reload() } catch (e) { setError(e instanceof Error ? e.message : 'Failed') } }
 
   const send = async () => {
     if (!draft.trim()) return
@@ -185,6 +230,12 @@ function PostCard({ post, me, goProfile, reload }: { post: FeedPost; me: User; g
       await api(`/posts/${post.id}/comments`, { method: 'POST', body: { text: draft, parentId: replyTo } })
       setDraft(''); setReplyTo(null); await loadComments(); reload()
     } catch (e) { setError(e instanceof Error ? e.message : 'Failed') }
+  }
+
+  const saveEdit = async () => {
+    if (!editText.trim()) return
+    try { await api(`/posts/${post.id}`, { method: 'PATCH', body: { text: editText } }); setEditing(false); reload() }
+    catch (e) { setError(e instanceof Error ? e.message : 'Failed') }
   }
 
   const renderComment = (c: CommentT, isReply = false) => (
@@ -202,13 +253,30 @@ function PostCard({ post, me, goProfile, reload }: { post: FeedPost; me: User; g
 
   return (
     <article className="post">
+      {post.repostedBy && <div className="meta" style={{ marginBottom: 4 }}>🔁 <span className="username" onClick={() => goProfile(post.repostedBy!.username)}>@{post.repostedBy.username}</span> reshared</div>}
+      {post.pinned && <div className="meta" style={{ marginBottom: 4 }}>📌 Pinned by <span className="username" onClick={() => goProfile(post.author.username)}>@{post.author.username}</span></div>}
+      {isPinnedPost && <div className="meta" style={{ marginBottom: 4 }}>📌 Pinned post</div>}
       <span className="username" onClick={() => goProfile(post.author.username)}>@{post.author.username}</span>
-      {post.author.isAgent && <span className="agent">AI agent</span>} <span className="meta">· {fmt(post.createdAt)}</span>
-      <div style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>{post.text}</div>
+      {post.author.isAgent && <span className="agent">AI agent</span>} <span className="meta">· {fmt(post.createdAt)}{post.editedAt ? ' · edited' : ''}</span>
+      {editing ? (
+        <div style={{ marginTop: 6 }}>
+          <textarea rows={3} maxLength={LIMITS.post} value={editText} onChange={(e) => setEditText(e.target.value)} />
+          <div className="actions">
+            <button className="primary" onClick={saveEdit}>Save edit</button>
+            <button onClick={() => setEditing(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}><RichText text={post.text} goTag={goTag} /></div>
+      )}
       {error && <div className="error">{error}</div>}
       <div className="actions">
-        <button onClick={async () => { await api(`/posts/${post.id}/like`, { method: 'POST' }); reload() }}>{post.likedByMe ? '❤️ Liked' : '🤍 Like'} · {post.likeCount}</button>
+        <button onClick={() => act(() => api(`/posts/${post.id}/like`, { method: 'POST' }))}>{post.likedByMe ? '❤️ Liked' : '🤍 Like'} · {post.likeCount}</button>
         <button onClick={toggleComments}>💬 Comments · {post.commentCount}</button>
+        <button onClick={() => act(() => api(`/posts/${post.id}/repost`, { method: 'POST' }))}>{post.repostedByMe ? '🔁 Reshared' : '🔁 Reshare'} · {post.repostCount}</button>
+        <button onClick={() => act(() => api(`/posts/${post.id}/bookmark`, { method: 'POST' }))}>{post.bookmarkedByMe ? '🔖 Saved' : '🔖 Save'}</button>
+        {post.mine && !editing && <button onClick={() => { setEditText(post.text); setEditing(true) }}>✏️ Edit</button>}
+        {post.mine && onPinToggle && <button onClick={() => onPinToggle(post)}>{isPinnedPost ? '📌 Unpin' : '📌 Pin'}</button>}
         {post.mine && <button className="danger" onClick={async () => { if (confirm('Delete this post?')) { await api(`/posts/${post.id}`, { method: 'DELETE' }); reload() } }}>Delete</button>}
       </div>
       {comments !== null && (
@@ -226,14 +294,15 @@ function PostCard({ post, me, goProfile, reload }: { post: FeedPost; me: User; g
 }
 
 /* ---------------- Profile ---------------- */
-function Profile({ username, me, goProfile, openDm }: { username: string; me: User; goProfile: (u: string) => void; openDm: (convId: string) => void }) {
+function Profile({ username, me, goProfile, openDm, refreshKey, goTag }: { username: string; me: User; goProfile: (u: string) => void; openDm: (convId: string) => void; refreshKey: number; goTag: (t: string) => void }) {
   const [data, setData] = useState<ProfileData | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [tab, setTab] = useState<'posts' | 'replies' | 'likes'>('posts')
+  const [tab, setTab] = useState<'posts' | 'replies' | 'likes' | 'saved'>('posts')
 
   const load = useCallback(() => { api<ProfileData>(`/users/${encodeURIComponent(username)}`).then(setData).catch((e) => setError(e.message)) }, [username])
   useEffect(load, [load])
+  useEffect(() => { load() }, [refreshKey, load])
   useEffect(() => { setTab('posts') }, [username])
   if (error) return <div className="card"><div className="error">{error}</div></div>
   if (!data) return <div className="card empty">Loading profile…</div>
@@ -242,6 +311,15 @@ function Profile({ username, me, goProfile, openDm }: { username: string; me: Us
   const act = async (path: string, msg: string) => {
     try { await api(path, { method: 'POST', body: {} }); setNotice(msg); load() } catch (e) { setError(e instanceof Error ? e.message : 'Failed') }
   }
+
+  const togglePin = async (p: FeedPost) => {
+    try {
+      if (data.pinnedPost?.id === p.id) await api(`/posts/${p.id}/pin`, { method: 'DELETE' })
+      else await api(`/posts/${p.id}/pin`, { method: 'POST', body: {} })
+      load()
+    } catch (e) { setError(e instanceof Error ? e.message : 'Failed') }
+  }
+  const pinProps = data.isMe ? { onPinToggle: togglePin } : {}
 
   return (
     <div className="card">
@@ -260,15 +338,21 @@ function Profile({ username, me, goProfile, openDm }: { username: string; me: Us
           <button onClick={() => { const reason = prompt('Why are you reporting this user?') ?? ''; actReport(u.username, reason, setNotice) }}>Report</button>
         </div>
       )}
+      {data.pinnedPost && (
+        <div style={{ marginTop: 12 }}>
+          <PostCard post={data.pinnedPost} me={me} goProfile={goProfile} reload={load} goTag={goTag} isPinnedPost {...pinProps} />
+        </div>
+      )}
       <div className="row" style={{ marginTop: 14 }}>
         <button className={tab === 'posts' ? 'primary grow' : 'grow'} onClick={() => setTab('posts')}>Posts · {data.posts.length}</button>
         <button className={tab === 'replies' ? 'primary grow' : 'grow'} onClick={() => setTab('replies')}>Replies · {data.replies.length}</button>
         {data.isMe && <button className={tab === 'likes' ? 'primary grow' : 'grow'} onClick={() => setTab('likes')}>Likes · {data.likedPosts?.length ?? 0}</button>}
+        {data.isMe && <button className={tab === 'saved' ? 'primary grow' : 'grow'} onClick={() => setTab('saved')}>Saved · {data.savedPosts?.length ?? 0}</button>}
       </div>
 
       {tab === 'posts' && (
-        data.posts.length === 0 ? <div className="empty">No posts yet.</div> :
-          data.posts.map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} />)
+        data.posts.filter((p) => p.id !== data.pinnedPost?.id).length === 0 ? <div className="empty">No posts yet.</div> :
+          data.posts.filter((p) => p.id !== data.pinnedPost?.id).map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} goTag={goTag} {...pinProps} />)
       )}
 
       {tab === 'replies' && (
@@ -284,7 +368,12 @@ function Profile({ username, me, goProfile, openDm }: { username: string; me: Us
 
       {tab === 'likes' && data.isMe && (
         (data.likedPosts ?? []).length === 0 ? <div className="empty">Posts you like will collect here.</div> :
-          (data.likedPosts ?? []).map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} />)
+          (data.likedPosts ?? []).map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} goTag={goTag} />)
+      )}
+
+      {tab === 'saved' && data.isMe && (
+        (data.savedPosts ?? []).length === 0 ? <div className="empty">Posts you save with 🔖 will collect here — your favourite lines, kept safe.</div> :
+          (data.savedPosts ?? []).map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={load} goTag={goTag} />)
       )}
     </div>
   )
@@ -294,31 +383,84 @@ async function actReport(username: string, reason: string, setNotice: (s: string
 }
 
 /* ---------------- Search ---------------- */
-function Search({ goProfile }: { goProfile: (u: string) => void }) {
+function Search({ me, goProfile, refreshKey, seed, goTag }: { me: User; goProfile: (u: string) => void; refreshKey: number; seed: { q: string; mode: 'people' | 'posts'; n: number } | null; goTag: (t: string) => void }) {
   const [q, setQ] = useState('')
+  const [mode, setMode] = useState<'people' | 'posts'>('people')
   const [users, setUsers] = useState<User[]>([])
+  const [posts, setPosts] = useState<FeedPost[]>([])
+
+  useEffect(() => { if (seed) { setQ(seed.q); setMode(seed.mode) } }, [seed])
+  const runSearch = useCallback(() => {
+    if (mode === 'people') api<{ users: User[] }>(`/users?q=${encodeURIComponent(q)}`).then((r) => setUsers(r.users)).catch(() => {})
+    else if (q.trim()) api<{ posts: FeedPost[] }>(`/search/posts?q=${encodeURIComponent(q)}`).then((r) => setPosts(r.posts)).catch(() => {})
+    else setPosts([])
+  }, [q, mode])
   useEffect(() => {
-    const t = setTimeout(() => { api<{ users: User[] }>(`/users?q=${encodeURIComponent(q)}`).then((r) => setUsers(r.users)).catch(() => {}) }, 250)
+    const t = setTimeout(runSearch, 250)
     return () => clearTimeout(t)
-  }, [q])
+  }, [runSearch])
+  useEffect(() => { runSearch() }, [refreshKey, runSearch])
+
   return (
     <div className="card">
-      <h2 style={{ marginTop: 0 }}>Find people</h2>
-      <input placeholder="Search by username…" value={q} onChange={(e) => setQ(e.target.value)} />
-      {users.length === 0 ? <div className="empty">No users found.</div> : users.map((u) => (
-        <div key={u.id} className="row" style={{ padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
-          <span className={`dot ${isOnline(u.lastSeenAt) ? 'on' : ''}`} />
-          <span className="username grow" onClick={() => goProfile(u.username)}>@{u.username}{u.isAgent && <span className="agent">AI</span>}</span>
-          <span className="small">{isOnline(u.lastSeenAt) ? 'Online' : 'Offline'}</span>
-          <button onClick={() => goProfile(u.username)}>View profile</button>
-        </div>
-      ))}
+      <h2 style={{ marginTop: 0 }}>Search</h2>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <button className={mode === 'people' ? 'primary grow' : 'grow'} onClick={() => setMode('people')}>People</button>
+        <button className={mode === 'posts' ? 'primary grow' : 'grow'} onClick={() => setMode('posts')}>Posts</button>
+      </div>
+      <input placeholder={mode === 'people' ? 'Search by username…' : 'Search words inside posts… (try a #tag)'} value={q} onChange={(e) => setQ(e.target.value)} />
+      {mode === 'people' ? (
+        users.length === 0 ? <div className="empty">No users found.</div> : users.map((u) => (
+          <div key={u.id} className="row" style={{ padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+            <span className={`dot ${isOnline(u.lastSeenAt) ? 'on' : ''}`} />
+            <span className="username grow" onClick={() => goProfile(u.username)}>@{u.username}{u.isAgent && <span className="agent">AI</span>}</span>
+            <span className="small">{isOnline(u.lastSeenAt) ? 'Online' : 'Offline'}</span>
+            <button onClick={() => goProfile(u.username)}>View profile</button>
+          </div>
+        ))
+      ) : (
+        posts.length === 0 ? <div className="empty">{q.trim() ? 'No posts match that search.' : 'Type something to search inside posts.'}</div> :
+          posts.map((p) => <PostCard key={p.id} post={p} me={me} goProfile={goProfile} reload={runSearch} goTag={goTag} />)
+      )}
+    </div>
+  )
+}
+
+/* ---------------- Notifications ---------------- */
+function Notifications({ me, goProfile, refreshKey }: { me: User; goProfile: (u: string) => void; refreshKey: number }) {
+  const [items, setItems] = useState<NotificationT[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const load = useCallback(() => {
+    api<{ notifications: NotificationT[] }>('/notifications').then((r) => setItems(r.notifications)).catch((e) => setError(e.message)).finally(() => setLoading(false))
+  }, [])
+  useEffect(() => { load() }, [load, refreshKey])
+
+  const label = (n: NotificationT) => n.type === 'like' ? 'liked your post' : n.type === 'comment' ? 'commented on your post' : n.type === 'reply' ? 'replied on your post' : 'started following you'
+  const icon = (n: NotificationT) => n.type === 'like' ? '❤️' : n.type === 'comment' ? '💬' : n.type === 'reply' ? '↩️' : '➕'
+  const target = (n: NotificationT) => goProfile(n.type === 'follow' ? n.actor.username : me.username)
+
+  return (
+    <div className="card">
+      <h2 style={{ marginTop: 0 }}>🔔 Notifications</h2>
+      {error && <div className="error">{error}</div>}
+      {loading ? <div className="empty">Loading…</div> : items.length === 0 ? <div className="empty">Nothing yet — likes, comments and new followers will land here.</div> :
+        items.map((n) => (
+          <div key={n.id} className="notifrow" onClick={() => target(n)}>
+            <span style={{ fontSize: 18 }}>{icon(n)}</span>
+            <div className="grow">
+              <span className="username">@{n.actor.username}</span>{n.actor.isAgent && <span className="agent">AI</span>} <span>{label(n)}</span>
+              {n.postText && <div className="meta" style={{ whiteSpace: 'pre-wrap' }}>“{n.postText}”</div>}
+            </div>
+            <span className="meta">{fmt(n.createdAt)}</span>
+          </div>
+        ))}
     </div>
   )
 }
 
 /* ---------------- Messages ---------------- */
-function Messages({ me, goProfile }: { me: User; goProfile: (u: string) => void }) {
+function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: string) => void; refreshKey: number }) {
   const [convs, setConvs] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<string | null>(sessionStorage.getItem('musetalk_open_conv'))
   const [messages, setMessages] = useState<Message[]>([])
@@ -342,6 +484,7 @@ function Messages({ me, goProfile }: { me: User; goProfile: (u: string) => void 
 
   useEffect(() => { loadConvs(); const t = setInterval(loadConvs, 5000); return () => clearInterval(t) }, [loadConvs])
   useEffect(() => { loadMsgs(); const t = setInterval(loadMsgs, 2500); return () => clearInterval(t) }, [loadMsgs]) // near-real-time: no manual refresh needed
+  useEffect(() => { loadConvs(); loadMsgs() }, [refreshKey, loadConvs, loadMsgs])
   useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [messages.length, activeId])
 
   const active = convs.find((c) => c.id === activeId)

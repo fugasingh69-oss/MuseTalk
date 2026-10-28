@@ -60,3 +60,19 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); border-color: tr
 .row { display: flex; gap: 10px; align-items: center; }
 .grow { flex: 1; }
 .empty { text-align: center; color: var(--muted); padding: 28px 10px; }
+
+/* ---- Oct 31 update ---- */
+.layout { padding-bottom: 110px; }
+.bottomnav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; background: color-mix(in srgb, var(--bg) 90%, transparent); backdrop-filter: blur(10px); border-top: 1px solid var(--border); }
+.bottomnav-in { display: flex; gap: 4px; padding: 8px 0 calc(8px + env(safe-area-inset-bottom)); }
+.bottomnav button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 1px; font-size: 19px; padding: 6px 2px; border-color: transparent; background: transparent; position: relative; }
+.bottomnav button span { font-size: 11px; }
+.bottomnav button .badge { position: absolute; top: 2px; right: calc(50% - 24px); margin: 0; }
+.bottomnav button.active { color: var(--accent); border-color: var(--accent); background: var(--panel2); }
+.taglink { color: var(--accent); cursor: pointer; font-weight: 600; }
+.taglink:hover { text-decoration: underline; }
+.trendrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 14px 0 4px; }
+.tagchip { font-size: 13px; padding: 4px 11px; border-radius: 999px; }
+.notifrow { display: flex; gap: 12px; align-items: flex-start; padding: 12px 8px; border-top: 1px solid var(--border); cursor: pointer; border-radius: 8px; }
+.notifrow:hover { background: var(--panel2); }
+.notifrow:first-of-type { border-top: none; }

@@ -12,10 +12,53 @@ const publicUser = (u: Record<string, unknown>) => ({
 })
 
 // Embedded author objects (feed / comments / profile) get the same camelCase shape.
-const pubAuthor = (a: unknown) => {
+const pubAuthor = (a: unknown): { id: string; username: string; isAgent: boolean } => {
   const r = (a ?? {}) as Record<string, unknown>
-  return { id: r.id, username: r.username, isAgent: !!r.is_agent }
+  return { id: r.id as string, username: r.username as string, isAgent: !!r.is_agent }
 }
+
+type PostRow = Record<string, unknown>
+type PostExtras = { liked: Set<string>; saved: Set<string>; reposted: Set<string>; repostCounts: Map<string, number> }
+
+// Like / bookmark / repost state for a set of posts, from the viewer's perspective.
+// Degrades gracefully to empty sets if the Oct-31 tables are not there yet,
+// so the site keeps working before the owner runs the update SQL.
+async function postExtras(supa: ReturnType<typeof db>, me: string, postIds: string[]): Promise<PostExtras> {
+  const empty: PostExtras = { liked: new Set(), saved: new Set(), reposted: new Set(), repostCounts: new Map() }
+  if (!postIds.length) return empty
+  const [likesR, savedR, myRepostsR, countsR] = await Promise.all([
+    supa.from('likes').select('post_id').eq('user_id', me).in('post_id', postIds),
+    supa.from('bookmarks').select('post_id').eq('user_id', me).in('post_id', postIds),
+    supa.from('reposts').select('post_id').eq('user_id', me).in('post_id', postIds),
+    supa.from('reposts').select('post_id').in('post_id', postIds),
+  ])
+  const repostCounts = new Map<string, number>()
+  for (const r of countsR.data ?? []) repostCounts.set(r.post_id as string, (repostCounts.get(r.post_id as string) ?? 0) + 1)
+  return {
+    liked: new Set((likesR.data ?? []).map((r) => r.post_id as string)),
+    saved: new Set((savedR.data ?? []).map((r) => r.post_id as string)),
+    reposted: new Set((myRepostsR.data ?? []).map((r) => r.post_id as string)),
+    repostCounts,
+  }
+}
+
+// The one post shape every list (feed / profile / search) returns.
+function shapePostRow(p: PostRow, author: { id: string; username: string; isAgent: boolean }, me: string, ex: PostExtras) {
+  return {
+    id: p.id, text: p.text, createdAt: p.created_at, editedAt: (p.edited_at as string | null) ?? null, author,
+    likeCount: (p.likes as { count: number }[])?.[0]?.count ?? 0,
+    commentCount: (p.comments as { count: number }[])?.[0]?.count ?? 0,
+    likedByMe: ex.liked.has(p.id as string),
+    bookmarkedByMe: ex.saved.has(p.id as string),
+    repostCount: ex.repostCounts.get(p.id as string) ?? 0,
+    repostedByMe: ex.reposted.has(p.id as string),
+    mine: author.id === me,
+  }
+}
+
+const excerpt = (t: string) => (t.length > 90 ? `${t.slice(0, 90)}…` : t)
+const POST_COLS = 'id, text, created_at, edited_at, likes(count), comments(count)'
+const POST_COLS_AUTHOR = 'id, text, created_at, edited_at, author:users!posts_author_id_fkey(id, username, is_agent), likes(count), comments(count)'
 
 async function register(event: Event) {
   const ip = clientIp(event.headers)
@@ -77,21 +120,55 @@ async function recover(event: Event) {
 async function feed(me: string) {
   const supa = db()
   const hidden = await blockedIds(me)
-  let q = supa.from('posts').select('id, text, created_at, author:users!posts_author_id_fkey(id, username, is_agent), likes(count), comments(count)')
+  let q = supa.from('posts').select(POST_COLS_AUTHOR)
     .order('created_at', { ascending: false }).limit(100)
   if (hidden.length) q = q.not('author_id', 'in', `(${hidden.join(',')})`)
   const { data, error } = await q
   if (error) throw new HttpError(500, 'Could not load the feed.')
-  const { data: myLikes } = await supa.from('likes').select('post_id').eq('user_id', me)
-  const liked = new Set((myLikes ?? []).map((l) => l.post_id))
-  return json(200, {
-    posts: (data ?? []).map((p: Record<string, unknown>) => ({
-      id: p.id, text: p.text, createdAt: p.created_at, author: pubAuthor(p.author),
-      likeCount: (p.likes as { count: number }[])?.[0]?.count ?? 0,
-      commentCount: (p.comments as { count: number }[])?.[0]?.count ?? 0,
-      likedByMe: liked.has(p.id as string), mine: (p.author as { id: string }).id === me,
-    })),
-  })
+  const rows = (data ?? []) as PostRow[]
+
+  // Recent reposts: a reshare floats the post back to the top of the feed,
+  // labelled with who shared it. (Errors pre-migration just mean "no reposts".)
+  const { data: repostRows } = await supa.from('reposts')
+    .select('created_at, user:users!reposts_user_id_fkey(id, username, is_agent), post:posts!reposts_post_id_fkey(id, text, created_at, edited_at, author:users!posts_author_id_fkey(id, username, is_agent), likes(count), comments(count))')
+    .order('created_at', { ascending: false }).limit(30)
+
+  const extraIds = new Set<string>(rows.map((p) => p.id as string))
+  for (const r of repostRows ?? []) {
+    const post = (r as PostRow).post as PostRow | null
+    if (post?.id) extraIds.add(post.id as string)
+  }
+  const ex = await postExtras(supa, me, [...extraIds])
+
+  type Entry = { sortAt: string; item: Record<string, unknown> }
+  const entries: Entry[] = rows.map((p) => ({ sortAt: p.created_at as string, item: shapePostRow(p, pubAuthor(p.author), me, ex) as Record<string, unknown> }))
+  for (const r of repostRows ?? []) {
+    const rr = r as PostRow
+    const post = rr.post as PostRow | null
+    if (!post) continue
+    const reposter = pubAuthor(rr.user)
+    const author = pubAuthor(post.author)
+    if (hidden.includes(reposter.id as string) || hidden.includes(author.id as string)) continue
+    if (reposter.id === me) continue // my own reshares don't re-float a post for me
+    entries.push({
+      sortAt: rr.created_at as string,
+      item: { ...shapePostRow(post, author, me, ex), repostedBy: { username: reposter.username, isAgent: reposter.isAgent }, repostAt: rr.created_at },
+    })
+  }
+  entries.sort((a, b) => b.sortAt.localeCompare(a.sortAt))
+  let items = entries.map((e) => e.item)
+
+  // The official account's pinned post rides on top of the feed.
+  const { data: official } = await supa.from('users').select('pinned_post_id').eq('username_lower', 'musetalk').maybeSingle()
+  if (official?.pinned_post_id) {
+    const { data: pinRow } = await supa.from('posts').select(POST_COLS_AUTHOR).eq('id', official.pinned_post_id).maybeSingle()
+    if (pinRow) {
+      const pinEx = await postExtras(supa, me, [pinRow.id as string])
+      const pinnedItem = { ...shapePostRow(pinRow as PostRow, pubAuthor((pinRow as PostRow).author), me, pinEx), pinned: true }
+      items = [pinnedItem, ...items.filter((it) => it.id !== pinnedItem.id)]
+    }
+  }
+  return json(200, { posts: items })
 }
 
 async function createPost(event: Event, me: { id: string }) {
@@ -117,6 +194,119 @@ async function toggleLike(me: string, postId: string) {
   const { error } = await supa.from('likes').insert({ post_id: postId, user_id: me })
   if (error) throw new HttpError(404, 'Post not found.')
   return json(200, { liked: true })
+}
+
+async function toggleBookmark(me: string, postId: string) {
+  const supa = db()
+  const { data: existing } = await supa.from('bookmarks').select('post_id').eq('post_id', postId).eq('user_id', me).maybeSingle()
+  if (existing) { await supa.from('bookmarks').delete().eq('post_id', postId).eq('user_id', me); return json(200, { bookmarked: false }) }
+  const { error } = await supa.from('bookmarks').insert({ post_id: postId, user_id: me })
+  if (error) throw new HttpError(500, 'Could not save this post. It may not exist, or the site update is not switched on yet.')
+  return json(200, { bookmarked: true })
+}
+
+async function toggleRepost(me: string, postId: string) {
+  const supa = db()
+  const { data: existing } = await supa.from('reposts').select('post_id').eq('post_id', postId).eq('user_id', me).maybeSingle()
+  let reposted: boolean
+  if (existing) { await supa.from('reposts').delete().eq('post_id', postId).eq('user_id', me); reposted = false }
+  else {
+    const { error } = await supa.from('reposts').insert({ post_id: postId, user_id: me })
+    if (error) throw new HttpError(500, 'Could not reshare this post. It may not exist, or the site update is not switched on yet.')
+    reposted = true
+  }
+  const { count } = await supa.from('reposts').select('*', { count: 'exact', head: true }).eq('post_id', postId)
+  return json(200, { reposted, repostCount: count ?? 0 })
+}
+
+const EDIT_WINDOW_MS = 30 * 60_000 // posts can be edited for 30 minutes after posting
+
+async function editPost(event: Event, me: string, postId: string) {
+  const body = await readBody(event)
+  const text = cleanText(String(body.text ?? ''), LIMITS.post)
+  if (!text) throw new HttpError(400, `Post must be 1–${LIMITS.post} characters of text.`)
+  const supa = db()
+  const { data: post } = await supa.from('posts').select('id, created_at').eq('id', postId).eq('author_id', me).maybeSingle()
+  if (!post) throw new HttpError(404, 'Post not found.')
+  if (Date.now() - new Date(post.created_at as string).getTime() > EDIT_WINDOW_MS) throw new HttpError(400, 'Posts can only be edited within 30 minutes of posting.')
+  const { data, error } = await supa.from('posts').update({ text, edited_at: new Date().toISOString() }).eq('id', postId).select('id, text, created_at, edited_at').single()
+  if (error) throw new HttpError(500, 'Could not edit the post.')
+  return json(200, { post: data })
+}
+
+async function setPin(me: string, postId: string, pin: boolean) {
+  const supa = db()
+  if (pin) {
+    const { data: post } = await supa.from('posts').select('id').eq('id', postId).eq('author_id', me).maybeSingle()
+    if (!post) throw new HttpError(404, 'You can only pin your own posts.')
+    const { error } = await supa.from('users').update({ pinned_post_id: postId }).eq('id', me)
+    if (error) throw new HttpError(500, 'Could not pin the post.')
+  } else {
+    await supa.from('users').update({ pinned_post_id: null }).eq('id', me).eq('pinned_post_id', postId)
+  }
+  return json(200, { pinned: pin })
+}
+
+async function searchPosts(me: string, query: string) {
+  const supa = db()
+  const hidden = await blockedIds(me)
+  const q = query.replace(/[%_]/g, '').trim()
+  if (!q) return json(200, { posts: [] })
+  let query2 = supa.from('posts').select(POST_COLS_AUTHOR)
+    .ilike('text', `%${q}%`).order('created_at', { ascending: false }).limit(50)
+  if (hidden.length) query2 = query2.not('author_id', 'in', `(${hidden.join(',')})`)
+  const { data, error } = await query2
+  if (error) throw new HttpError(500, 'Could not search posts.')
+  const rows = (data ?? []) as PostRow[]
+  const ex = await postExtras(supa, me, rows.map((p) => p.id as string))
+  return json(200, { posts: rows.map((p) => shapePostRow(p, pubAuthor(p.author), me, ex)) })
+}
+
+// Notifications are derived live from likes / comments / follows on your own
+// activity — no separate table, nothing extra to maintain or lose.
+async function notifications(me: string) {
+  const supa = db()
+  const hidden = await blockedIds(me)
+  type Notif = { id: string; type: string; actor: { id: string; username: string; isAgent: boolean }; postId?: string; postText?: string; createdAt: string }
+  const out: Notif[] = []
+  const [likesR, commentsR, followsR] = await Promise.all([
+    supa.from('likes').select('created_at, post_id, user:users!likes_user_id_fkey(id, username, is_agent), post:posts!likes_post_id_fkey!inner(text, author_id)')
+      .eq('post.author_id', me).neq('user_id', me).order('created_at', { ascending: false }).limit(30),
+    supa.from('comments').select('created_at, post_id, parent_id, author:users!comments_author_id_fkey(id, username, is_agent), post:posts!comments_post_id_fkey!inner(text, author_id)')
+      .eq('post.author_id', me).neq('author_id', me).order('created_at', { ascending: false }).limit(30),
+    supa.from('follows').select('created_at, follower:users!follows_follower_id_fkey(id, username, is_agent)')
+      .eq('following_id', me).order('created_at', { ascending: false }).limit(30),
+  ])
+  for (const l of likesR.data ?? []) {
+    const r = l as PostRow; const actor = pubAuthor(r.user)
+    if (hidden.includes(actor.id as string)) continue
+    out.push({ id: `like-${r.post_id}-${actor.id}`, type: 'like', actor, postId: r.post_id as string, postText: excerpt((r.post as { text: string }).text), createdAt: r.created_at as string })
+  }
+  for (const c of commentsR.data ?? []) {
+    const r = c as PostRow; const actor = pubAuthor(r.author)
+    if (hidden.includes(actor.id as string)) continue
+    out.push({ id: `comment-${r.post_id}-${r.created_at}`, type: r.parent_id ? 'reply' : 'comment', actor, postId: r.post_id as string, postText: excerpt((r.post as { text: string }).text), createdAt: r.created_at as string })
+  }
+  for (const f of followsR.data ?? []) {
+    const r = f as PostRow; const actor = pubAuthor(r.follower)
+    if (hidden.includes(actor.id as string)) continue
+    out.push({ id: `follow-${actor.id}-${r.created_at}`, type: 'follow', actor, createdAt: r.created_at as string })
+  }
+  out.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  return json(200, { notifications: out.slice(0, 50) })
+}
+
+// Light "trending words": the most-used #tags across the latest posts.
+async function trending() {
+  const { data } = await db().from('posts').select('text').order('created_at', { ascending: false }).limit(300)
+  const counts = new Map<string, number>()
+  for (const p of data ?? []) {
+    const inPost = new Set<string>()
+    for (const m of (p.text as string).matchAll(/#([\p{L}\p{N}_]+)/gu)) inPost.add(m[1].toLowerCase())
+    for (const t of inPost) counts.set(t, (counts.get(t) ?? 0) + 1)
+  }
+  const tags = [...counts.entries()].map(([tag, count]) => ({ tag, count })).sort((a, b) => b.count - a.count).slice(0, 6)
+  return json(200, { tags })
 }
 
 async function listComments(me: string, postId: string) {
@@ -163,22 +353,30 @@ async function profile(me: string, username: string) {
   const isMe = user.id === me
   const authorPub = { id: user.id as string, username: user.username as string, isAgent: !!user.is_agent }
 
-  const [{ count: followers }, { count: following }, { data: followRow }, { data: postRows }, { data: myLikeRows }, { data: commentRows }] = await Promise.all([
+  const [{ count: followers }, { count: following }, { data: followRow }, { data: postRows }, { data: commentRows }] = await Promise.all([
     supa.from('follows').select('*', { count: 'exact', head: true }).eq('following_id', user.id),
     supa.from('follows').select('*', { count: 'exact', head: true }).eq('follower_id', user.id),
     supa.from('follows').select('follower_id').eq('follower_id', me).eq('following_id', user.id).maybeSingle(),
-    supa.from('posts').select('id, text, created_at, likes(count), comments(count)').eq('author_id', user.id).order('created_at', { ascending: false }).limit(50),
-    supa.from('likes').select('post_id').eq('user_id', me),
+    supa.from('posts').select(POST_COLS).eq('author_id', user.id).order('created_at', { ascending: false }).limit(50),
     supa.from('comments').select('id, text, created_at, parent_id, post_id').eq('author_id', user.id).order('created_at', { ascending: false }).limit(50),
   ])
-  const likedSet = new Set((myLikeRows ?? []).map((l) => l.post_id as string))
-  const shapePost = (p: Record<string, unknown>, author: { id: string; username: string; isAgent: boolean }) => ({
-    id: p.id, text: p.text, createdAt: p.created_at, author,
-    likeCount: (p.likes as { count: number }[])?.[0]?.count ?? 0,
-    commentCount: (p.comments as { count: number }[])?.[0]?.count ?? 0,
-    likedByMe: likedSet.has(p.id as string), mine: author.id === me,
-  })
-  const posts = (postRows ?? []).map((p) => shapePost(p as Record<string, unknown>, authorPub))
+  const pinnedId = (user.pinned_post_id as string | null) ?? null
+  const profileIds = (postRows ?? []).map((p) => (p as PostRow).id as string)
+  if (pinnedId && !profileIds.includes(pinnedId)) profileIds.push(pinnedId)
+  const exProfile = await postExtras(supa, me, profileIds)
+  const shapePost = (p: PostRow, author: { id: string; username: string; isAgent: boolean }) => shapePostRow(p, author, me, exProfile)
+  const posts = (postRows ?? []).map((p) => shapePost(p as PostRow, authorPub))
+
+  // Pinned post — shown at the top of the profile, above the posts list.
+  let pinnedPost: Record<string, unknown> | null = null
+  if (pinnedId) {
+    const inList = posts.find((p) => p.id === pinnedId)
+    if (inList) pinnedPost = inList as Record<string, unknown>
+    else {
+      const { data: pinRow } = await supa.from('posts').select(POST_COLS).eq('id', pinnedId).maybeSingle()
+      if (pinRow) pinnedPost = shapePost(pinRow as PostRow, authorPub) as Record<string, unknown>
+    }
+  }
 
   // Replies: every comment this user wrote, with the post it belongs to as context.
   let replies: Record<string, unknown>[] = []
@@ -208,19 +406,34 @@ async function profile(me: string, username: string) {
     const { data: likeRows } = await supa.from('likes').select('post_id').eq('user_id', me).order('created_at', { ascending: false }).limit(50)
     const ids = (likeRows ?? []).map((l) => l.post_id as string)
     if (ids.length) {
-      const { data: liked } = await supa.from('posts')
-        .select('id, text, created_at, author:users!posts_author_id_fkey(id, username, is_agent), likes(count), comments(count)')
-        .in('id', ids)
+      const { data: liked } = await supa.from('posts').select(POST_COLS_AUTHOR).in('id', ids)
+      const exLiked = await postExtras(supa, me, ids)
       const byId = new Map((liked ?? []).map((p) => [(p as Record<string, unknown>).id as string, p as Record<string, unknown>]))
       likedPosts = ids.map((id) => byId.get(id)).filter((p): p is Record<string, unknown> => !!p)
-        .map((p) => shapePost(p, pubAuthor(p.author)))
+        .map((p) => shapePostRow(p, pubAuthor(p.author), me, exLiked))
+    }
+  }
+
+  // Saved (bookmarked) posts — same deal: own profile only, most recent save first.
+  let savedPosts: Record<string, unknown>[] | undefined
+  if (isMe) {
+    savedPosts = []
+    const { data: saveRows } = await supa.from('bookmarks').select('post_id').eq('user_id', me).order('created_at', { ascending: false }).limit(50)
+    const ids = (saveRows ?? []).map((l) => l.post_id as string)
+    if (ids.length) {
+      const { data: saved } = await supa.from('posts').select(POST_COLS_AUTHOR).in('id', ids)
+      const exSaved = await postExtras(supa, me, ids)
+      const byId = new Map((saved ?? []).map((p) => [(p as Record<string, unknown>).id as string, p as Record<string, unknown>]))
+      savedPosts = ids.map((id) => byId.get(id)).filter((p): p is Record<string, unknown> => !!p)
+        .map((p) => shapePostRow(p, pubAuthor(p.author), me, exSaved))
     }
   }
 
   return json(200, {
     user: publicUser(user), followers: followers ?? 0, following: following ?? 0,
-    followedByMe: !!followRow, isMe, posts, replies,
+    followedByMe: !!followRow, isMe, posts, replies, pinnedPost,
     ...(likedPosts !== undefined ? { likedPosts } : {}),
+    ...(savedPosts !== undefined ? { savedPosts } : {}),
   })
 }
 
@@ -378,10 +591,18 @@ export async function handler(event: Event) {
     if (method === 'GET' && seg[0] === 'feed') return await feed(me.id)
     if (method === 'POST' && seg[0] === 'posts' && seg.length === 1) return await createPost(event, me)
     if (method === 'DELETE' && seg[0] === 'posts' && seg.length === 2) return await deletePost(me.id, seg[1])
+    if (method === 'PATCH' && seg[0] === 'posts' && seg.length === 2) return await editPost(event, me.id, seg[1])
     if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'like') return await toggleLike(me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'bookmark') return await toggleBookmark(me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'repost') return await toggleRepost(me.id, seg[1])
+    if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'pin') return await setPin(me.id, seg[1], true)
+    if (method === 'DELETE' && seg[0] === 'posts' && seg[2] === 'pin') return await setPin(me.id, seg[1], false)
     if (method === 'GET' && seg[0] === 'posts' && seg[2] === 'comments') return await listComments(me.id, seg[1])
     if (method === 'POST' && seg[0] === 'posts' && seg[2] === 'comments') return await createComment(event, me.id, seg[1])
     if (method === 'DELETE' && seg[0] === 'comments' && seg.length === 2) return await deleteComment(me.id, seg[1])
+    if (method === 'GET' && seg[0] === 'search' && seg[1] === 'posts') return await searchPosts(me.id, String(event.queryStringParameters?.q ?? ''))
+    if (method === 'GET' && seg[0] === 'notifications') return await notifications(me.id)
+    if (method === 'GET' && seg[0] === 'trending') return await trending()
 
     if (method === 'GET' && seg[0] === 'users' && seg.length === 1) return await searchUsers(me.id, String(event.queryStringParameters?.q ?? ''))
     if (method === 'GET' && seg[0] === 'users' && seg.length === 2) return await profile(me.id, seg[1])

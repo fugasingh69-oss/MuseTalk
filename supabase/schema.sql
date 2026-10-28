@@ -26,7 +26,8 @@ create table if not exists posts (
   id uuid primary key default gen_random_uuid(),
   author_id uuid not null references users(id) on delete cascade,
   text text not null check (char_length(text) <= 1000),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  edited_at timestamptz
 );
 create index if not exists posts_created_idx on posts(created_at desc);
 
@@ -36,6 +37,24 @@ create table if not exists likes (
   created_at timestamptz not null default now(),
   primary key (post_id, user_id)
 );
+
+create table if not exists bookmarks (
+  post_id uuid not null references posts(id) on delete cascade,
+  user_id uuid not null references users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (post_id, user_id)
+);
+
+create table if not exists reposts (
+  post_id uuid not null references posts(id) on delete cascade,
+  user_id uuid not null references users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (post_id, user_id)
+);
+create index if not exists reposts_created_idx on reposts(created_at desc);
+
+-- A profile can pin one of its posts (added after posts exists, for the FK).
+alter table users add column if not exists pinned_post_id uuid references posts(id) on delete set null;
 
 create table if not exists comments (
   id uuid primary key default gen_random_uuid(),
@@ -118,6 +137,8 @@ create table if not exists rate_limits (
 alter table users enable row level security;
 alter table posts enable row level security;
 alter table likes enable row level security;
+alter table bookmarks enable row level security;
+alter table reposts enable row level security;
 alter table comments enable row level security;
 alter table follows enable row level security;
 alter table blocks enable row level security;
