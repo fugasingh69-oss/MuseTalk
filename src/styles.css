@@ -26,6 +26,9 @@
      Layout spacing everywhere is derived from this one value,
      so the bar can never cover content again. */
   --nav-h: calc(66px + env(safe-area-inset-bottom, 0px));
+  /* Sticky header height (single row on desktop; it wraps to two rows
+     under 640px — see the header media query below). */
+  --topbar-h: 60px;
 }
 [data-theme='light'] {
   --bg: #f2f5f8;
@@ -218,13 +221,27 @@ input:focus, textarea:focus {
 .recovery { font-family: ui-monospace, monospace; font-size: 19px; letter-spacing: 1px; text-align: center; padding: 13px; background: var(--panel2); border-radius: 12px; border: 1px dashed var(--accent); user-select: all; }
 
 /* ---------- Messages ---------- */
-.chatlayout { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+.chatlayout { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: stretch; }
+/* The messages view is an app-style panel: its height is exactly the
+   viewport minus header, bottom bar and layout padding (100dvh tracks
+   the visible height, so the mobile keyboard shrinks it gracefully).
+   History flexes and scrolls inside; the composer stays anchored. */
+.chatlayout { height: calc(100dvh - var(--topbar-h) - var(--nav-h) - 56px); min-height: 340px; }
+.chatlayout > .card { min-height: 0; }
+.inboxcard { overflow-y: auto; }
+.threadcard { display: flex; flex-direction: column; }
+.threadcard .messages { flex: 1; height: auto; min-height: 0; }
+.threadcard .messages .empty { margin: auto; }
 @media (max-width: 760px) { .chatlayout { grid-template-columns: 1fr; } }
 .conv { padding: 11px 12px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; transition: background .15s ease, border-color .15s ease; }
 .conv:hover { background: var(--panel2); }
 .conv.active { background: var(--panel2); border-color: var(--border-strong); }
 .messages { height: 46vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 8px 2px; scrollbar-width: thin; }
-.bubble { max-width: 78%; padding: 10px 13px; border-radius: 16px; background: var(--panel2); border: 1px solid var(--border); align-self: flex-start; white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+.bubble { position: relative; max-width: 75%; padding: 10px 13px; border-radius: 16px; background: var(--panel2); border: 1px solid var(--border); align-self: flex-start; white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+.msgrow { display: flex; flex-direction: column; align-items: flex-start; }
+.msgrow.mine { align-items: flex-end; }
+.msgrow.grouped { margin-top: -4px; } /* same sender as above: sit closer */
+@media (max-width: 760px) { .bubble { max-width: 82%; } }
 .bubble.mine { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; }
 .bubble .meta { color: inherit; opacity: .75; }
 .sendrow { display: flex; gap: 8px; margin-top: 10px; }
@@ -283,13 +300,31 @@ input:focus, textarea:focus {
 .chathead { display: flex; align-items: center; gap: 10px; padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--border); }
 .backbtn { display: none; font-size: 17px; padding: 6px 11px; line-height: 1; }
 
-/* Delete-my-message control, inside my own bubbles */
-.msgdel {
-  background: transparent; border: none; color: inherit; opacity: .6;
-  font-size: 11px; padding: 3px 2px 0; margin-top: 2px; border-radius: 6px;
+/* My-message options: a quiet ⋯ on the bubble opens a compact menu —
+   bubbles stay clean instead of carrying a Delete label each. */
+.msgmenu-btn {
+  position: absolute; top: 4px; right: 6px; width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 14px; line-height: 1; border: none; border-radius: 50%;
+  background: color-mix(in srgb, var(--bg) 38%, transparent); color: inherit; opacity: 0;
 }
-.msgdel:hover { opacity: 1; background: transparent; border: none; text-decoration: underline; }
-.msgdel:active { transform: none; }
+.bubble:hover .msgmenu-btn, .bubble:focus-within .msgmenu-btn { opacity: .9; }
+.bubble.mine .msgmenu-btn { background: rgba(0, 0, 0, .22); }
+@media (hover: none) { .msgmenu-btn { opacity: .55; } } /* touch: always faintly visible */
+.msgmenu {
+  margin-top: 6px; min-width: 168px; display: grid; padding: 4px; z-index: 5;
+  background: var(--panel3); border: 1px solid var(--border-strong);
+  border-radius: 12px; box-shadow: var(--shadow);
+}
+.msgmenu button { text-align: left; border: none; background: transparent; padding: 8px 10px; border-radius: 8px; font-size: 13.5px; }
+.msgmenu button:hover { background: var(--panel2); border: none; }
+
+/* "Load older" — a quiet centred link, rendered only when older history exists */
+.olderbtn { align-self: center; border: none; background: transparent; color: var(--accent); font-size: 13px; font-weight: 600; padding: 5px 12px; margin-bottom: 8px; }
+.olderbtn:hover { background: transparent; border: none; text-decoration: underline; }
+
+/* Composer: anchored at the foot of the thread, separated by a hairline */
+.chatcomposer { border-top: 1px solid var(--border); padding-top: 10px; background: var(--panel); }
 
 /* Alerts: unread rows stand out (accent edge + dot), read rows stay quiet */
 .notifrow.unread { background: color-mix(in srgb, var(--accent) 7%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
@@ -298,6 +333,7 @@ input:focus, textarea:focus {
 /* Header on small screens: branding row, then one even row of controls —
    everything (Refresh, Settings, theme, Log out) stays reachable. */
 @media (max-width: 640px) {
+  :root { --topbar-h: 94px; } /* header wraps to two rows at this width */
   .topbar-in { flex-wrap: wrap; row-gap: 8px; padding: 9px 0; }
   .logo { font-size: 20px; }
   .nav { width: 100%; margin-left: 0; flex-wrap: nowrap; }
@@ -310,7 +346,10 @@ input:focus, textarea:focus {
   .backbtn { display: inline-flex; }
   .chatlayout.has-active > .card:first-child { display: none; }
   .chatlayout:not(.has-active) > .card:last-child { display: none; }
-  .messages { height: 52vh; }
+  /* An open conversation goes full-bleed: no page gutter, no card frame —
+     the chat uses the entire viewport width, Instagram-style. */
+  .wrap.layout:has(.chatlayout.has-active) { padding-left: 0; padding-right: 0; }
+  .chatlayout.has-active .threadcard { border-radius: 0; border-left: none; border-right: none; padding: 14px 12px 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

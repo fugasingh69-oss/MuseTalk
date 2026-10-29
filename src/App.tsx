@@ -500,6 +500,10 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
   const [groupName, setGroupName] = useState('')
   const [groupMembers, setGroupMembers] = useState('')
   const [filter, setFilter] = useState('')
+  const [menuFor, setMenuFor] = useState<string | null>(null) // which of my bubbles has its ⋯ menu open
+  const [hasOlder, setHasOlder] = useState(false) // only offer "Load older" when a full first page came back
+  const [msgsLoading, setMsgsLoading] = useState(false)
+  const loadedForRef = useRef<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const stickingRef = useRef(true) // auto-scroll only while the reader is at/near the bottom
 
@@ -507,16 +511,38 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
   const loadMsgs = useCallback(() => {
     if (!activeId) return
     api<{ messages: Message[] }>(`/conversations/${activeId}/messages`).then((r) => {
-      setMessages((prev) => { if (JSON.stringify(prev.map((m) => m.id)) !== JSON.stringify(r.messages.map((m) => m.id))) return r.messages; return prev })
+      if (loadedForRef.current !== activeId) {
+        loadedForRef.current = activeId
+        setHasOlder(r.messages.length >= 50) // a full first page means older history may exist
+        setMsgsLoading(false)
+      }
+      setMessages((prev) => {
+        // Merge, never blindly replace: history loaded via "Load older" must
+        // survive the poll (the previous code silently wiped it within ~2.5s).
+        // Only messages older than the fetched window are kept, so deletions
+        // inside the current window still take effect immediately.
+        if (!prev.length) return r.messages
+        const fetchedIds = new Set(r.messages.map((m) => m.id))
+        const oldest = r.messages[0]?.created_at
+        const kept = oldest ? prev.filter((m) => m.created_at < oldest && !fetchedIds.has(m.id)) : []
+        const merged = [...kept, ...r.messages].sort((a, b) => a.created_at.localeCompare(b.created_at))
+        return JSON.stringify(merged.map((m) => m.id)) === JSON.stringify(prev.map((m) => m.id)) ? prev : merged
+      })
       api(`/conversations/${activeId}/read`, { method: 'POST' }).catch(() => {})
-    }).catch(() => {})
+    }).catch(() => { setMsgsLoading(false) })
   }, [activeId])
 
   useEffect(() => { loadConvs(); const t = setInterval(loadConvs, 5000); return () => clearInterval(t) }, [loadConvs])
   useEffect(() => { loadMsgs(); const t = setInterval(loadMsgs, 2500); return () => clearInterval(t) }, [loadMsgs]) // near-real-time: no manual refresh needed
   useEffect(() => { loadConvs(); loadMsgs() }, [refreshKey, loadConvs, loadMsgs])
-  // Opening a conversation starts at the newest message…
-  useEffect(() => { stickingRef.current = true; scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [activeId])
+  // Opening a conversation starts at the newest message, with a clean slate:
+  // no previous conversation's messages, no stale menu, a loading state.
+  useEffect(() => {
+    stickingRef.current = true
+    setMessages([]); setMenuFor(null); setHasOlder(false); loadedForRef.current = null
+    setMsgsLoading(!!activeId)
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+  }, [activeId])
   // …but new arrivals only pull the view down while the reader is already at
   // the bottom — scrolling up to read history is never interrupted.
   useEffect(() => { if (stickingRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [messages])
@@ -541,6 +567,7 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
     const el = scrollRef.current
     const prevHeight = el?.scrollHeight ?? 0
     const r = await api<{ messages: Message[] }>(`/conversations/${activeId}/messages?before=${encodeURIComponent(messages[0].created_at)}`)
+    setHasOlder(r.messages.length >= 50) // a short page means the beginning of the conversation is reached
     if (!r.messages.length) return
     stickingRef.current = false
     setMessages((prev) => [...r.messages, ...prev])
@@ -550,6 +577,7 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
 
   const delMsg = async (m: Message) => {
     if (!activeId) return
+    setMenuFor(null)
     if (!confirm('Delete this message? It will disappear for everyone in this conversation.')) return
     try {
       await api(`/conversations/${activeId}/messages/${m.id}`, { method: 'DELETE' })
@@ -571,7 +599,7 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
 
   return (
     <div className={`chatlayout ${activeId ? 'has-active' : ''}`}>
-      <div className="card">
+      <div className="card inboxcard">
         <h3 style={{ marginTop: 0 }}>Messages</h3>
         {error && <div className="error">{error}</div>}
         {convs.length > 3 && <input className="inboxfilter" placeholder="Search conversations…" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Search conversations" />}
@@ -596,7 +624,7 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
         <input placeholder="Members, comma separated usernames" value={groupMembers} onChange={(e) => setGroupMembers(e.target.value)} />
         <button className="primary" style={{ marginTop: 8, width: '100%' }} onClick={startGroup}>Create group</button>
       </div>
-      <div className="card">
+      <div className="card threadcard">
         {!active ? <div className="empty">Pick a conversation on the left, or start a new one.</div> : <>
           <div className="chathead">
             <button className="backbtn" aria-label="Back to conversations" onClick={() => { setActiveId(null); sessionStorage.removeItem('musetalk_open_conv') }}>←</button>
@@ -611,20 +639,33 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
               {active.participants.map((p) => <span key={p.id}> <span className={`dot ${isOnline(p.lastSeenAt) ? 'on' : ''}`} /><span className="username" onClick={() => goProfile(p.username)}>@{p.username}</span></span>)}
             </p>
           )}
-          <button onClick={loadOlder}>Load older messages</button>
+          {hasOlder && <button className="olderbtn" onClick={loadOlder}>Load older messages</button>}
           <div className="messages" ref={scrollRef} onScroll={onScrollMsgs}>
-            {messages.length === 0 ? <div className="empty">No messages yet. Say hello 👋</div> :
-              messages.map((m) => (
-                <div key={m.id} className={`bubble ${m.sender.id === me.id ? 'mine' : ''}`}>
-                  {active.isGroup && m.sender.id !== me.id && <div className="meta">@{m.sender.username}</div>}
-                  <div>{m.text}</div>
-                  <div className="meta" style={{ fontSize: 11, marginTop: 3 }}>{fmt(m.created_at)}</div>
-                  {m.sender.id === me.id && <button className="msgdel" title="Delete this message for everyone" aria-label="Delete this message" onClick={() => delMsg(m)}>🗑 Delete</button>}
-                </div>
-              ))}
+            {msgsLoading && messages.length === 0 ? <div className="empty">Loading messages…</div> :
+              messages.length === 0 ? <div className="empty">No messages yet. Say hello 👋</div> :
+              messages.map((m, i) => {
+                const mine = m.sender.id === me.id
+                const grouped = i > 0 && messages[i - 1].sender.id === m.sender.id // same sender as the message above
+                return (
+                  <div key={m.id} className={`msgrow ${mine ? 'mine' : ''} ${grouped ? 'grouped' : ''}`}>
+                    <div className={`bubble ${mine ? 'mine' : ''} ${grouped ? 'grouped' : ''}`}>
+                      {active.isGroup && !mine && !grouped && <div className="meta">@{m.sender.username}</div>}
+                      <div>{m.text}</div>
+                      <div className="meta" style={{ fontSize: 11, marginTop: 3 }}>{fmt(m.created_at)}</div>
+                      {mine && <button className="msgmenu-btn" title="Message options" aria-label="Message options" aria-haspopup="menu" aria-expanded={menuFor === m.id} onClick={() => setMenuFor(menuFor === m.id ? null : m.id)}>⋯</button>}
+                    </div>
+                    {mine && menuFor === m.id && (
+                      <div className="msgmenu" role="menu">
+                        <button className="danger" onClick={() => delMsg(m)}>🗑 Delete message</button>
+                        <button onClick={() => setMenuFor(null)}>Cancel</button>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
           </div>
           {failed && <div className="error">Message failed to send — your text is still in the box. <button onClick={send}>Retry</button></div>}
-          <div className="sendrow">
+          <div className="sendrow chatcomposer">
             <textarea placeholder="Type a text message…" maxLength={LIMITS.message} value={draft} onChange={(e) => setDraft(e.target.value)} aria-label="Message text"
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} />
             <button className="primary" disabled={sending} onClick={send}>{sending ? 'Sending…' : 'Send'}</button>
