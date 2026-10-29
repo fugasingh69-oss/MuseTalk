@@ -40,11 +40,20 @@ export async function handler() {
   const ids = queued.map((q) => q.message_id)
   const { data: msgs } = await supa
     .from('messages')
-    .select('id, conversation_id, sender_id, text, created_at, sender:users!messages_sender_id_fkey(username)')
+    .select('id, conversation_id, sender_id, text, created_at, deleted_at, sender:users!messages_sender_id_fkey(username)')
     .in('id', ids)
   if (!msgs?.length) return { statusCode: 200, body: 'Nothing to archive.' }
 
-  const archive: ArchiveMessage[] = msgs.map((m: Record<string, unknown>) => ({
+  // A message the sender deleted before it was archived must never reach
+  // Drive: drop it from the queue entirely instead of syncing it.
+  const deletedIds = msgs.filter((m) => m.deleted_at).map((m) => String(m.id))
+  if (deletedIds.length) {
+    await supa.from('drive_sync_queue').delete().in('message_id', deletedIds)
+  }
+  const liveMsgs = msgs.filter((m) => !m.deleted_at)
+  if (!liveMsgs.length) return { statusCode: 200, body: 'Nothing to archive (deleted messages dropped from the queue).' }
+
+  const archive: ArchiveMessage[] = liveMsgs.map((m: Record<string, unknown>) => ({
     id: String(m.id),
     conversationId: String(m.conversation_id),
     senderId: String(m.sender_id),

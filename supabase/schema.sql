@@ -109,7 +109,8 @@ create table if not exists messages (
   conversation_id uuid not null references conversations(id) on delete cascade,
   sender_id uuid not null references users(id) on delete cascade,
   text text not null check (char_length(text) <= 2000),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  deleted_at timestamptz -- soft delete: set when the sender deletes the message; hidden from the app for everyone
 );
 create index if not exists messages_conv_idx on messages(conversation_id, created_at desc);
 

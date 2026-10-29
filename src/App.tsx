@@ -43,6 +43,9 @@ export default function App() {
 
   const goTag = (tag: string) => { setSearchSeed({ q: `#${tag}`, mode: 'posts', n: Date.now() }); setProfileName(null); setView('search') }
   const openNotifications = () => {
+    // Hand the previous "seen" marker to the Alerts page so it can highlight
+    // the rows that are genuinely unread, then mark everything as seen.
+    sessionStorage.setItem('musetalk_notif_prev_seen', localStorage.getItem('musetalk_notif_seen') ?? '')
     setProfileName(null); setView('notifications')
     localStorage.setItem('musetalk_notif_seen', new Date().toISOString()); setNotifUnread(0)
   }
@@ -271,10 +274,10 @@ function PostCard({ post, me, goProfile, reload, goTag, isPinnedPost, onPinToggl
       )}
       {error && <div className="error">{error}</div>}
       <div className="actions">
-        <button onClick={() => act(() => api(`/posts/${post.id}/like`, { method: 'POST' }))}>{post.likedByMe ? '❤️ Liked' : '🤍 Like'} · {post.likeCount}</button>
-        <button onClick={toggleComments}>💬 Comments · {post.commentCount}</button>
-        <button onClick={() => act(() => api(`/posts/${post.id}/repost`, { method: 'POST' }))}>{post.repostedByMe ? '🔁 Reshared' : '🔁 Reshare'} · {post.repostCount}</button>
-        <button onClick={() => act(() => api(`/posts/${post.id}/bookmark`, { method: 'POST' }))}>{post.bookmarkedByMe ? '🔖 Saved' : '🔖 Save'}</button>
+        <button className={`iconbtn ${post.likedByMe ? 'on' : ''}`} title={post.likedByMe ? 'Unlike this post' : 'Like this post'} aria-label={`Like this post (${post.likeCount} likes)`} aria-pressed={post.likedByMe} onClick={() => act(() => api(`/posts/${post.id}/like`, { method: 'POST' }))}>{post.likedByMe ? '❤️' : '🤍'}<span>{post.likeCount}</span></button>
+        <button className="iconbtn" title="Comments — view and write" aria-label={`Comments (${post.commentCount})`} onClick={toggleComments}>💬<span>{post.commentCount}</span></button>
+        <button className={`iconbtn ${post.repostedByMe ? 'on' : ''}`} title={post.repostedByMe ? 'Undo reshare' : 'Reshare to your followers'} aria-label={`Reshare this post (${post.repostCount} reshares)`} aria-pressed={post.repostedByMe} onClick={() => act(() => api(`/posts/${post.id}/repost`, { method: 'POST' }))}>🔁<span>{post.repostCount}</span></button>
+        <button className={`iconbtn ${post.bookmarkedByMe ? 'on' : ''}`} title={post.bookmarkedByMe ? 'Remove from Saved' : 'Save this post'} aria-label="Save this post" aria-pressed={post.bookmarkedByMe} onClick={() => act(() => api(`/posts/${post.id}/bookmark`, { method: 'POST' }))}>🔖</button>
         {post.mine && !editing && <button onClick={() => { setEditText(post.text); setEditing(true) }}>✏️ Edit</button>}
         {post.mine && onPinToggle && <button onClick={() => onPinToggle(post)}>{isPinnedPost ? '📌 Unpin' : '📌 Pin'}</button>}
         {post.mine && <button className="danger" onClick={async () => { if (confirm('Delete this post?')) { await api(`/posts/${post.id}`, { method: 'DELETE' }); reload() } }}>Delete</button>}
@@ -431,12 +434,16 @@ function Notifications({ me, goProfile, refreshKey }: { me: User; goProfile: (u:
   const [items, setItems] = useState<NotificationT[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  // Read/unread is tracked on this device (the server derives notifications
+  // live and stores no read state): rows newer than the marker captured when
+  // this page was opened are shown as unread.
+  const [prevSeen] = useState(() => sessionStorage.getItem('musetalk_notif_prev_seen') ?? '')
   const load = useCallback(() => {
     api<{ notifications: NotificationT[] }>('/notifications').then((r) => setItems(r.notifications)).catch((e) => setError(e.message)).finally(() => setLoading(false))
   }, [])
   useEffect(() => { load() }, [load, refreshKey])
 
-  const label = (n: NotificationT) => n.type === 'like' ? 'liked your post' : n.type === 'comment' ? 'commented on your post' : n.type === 'reply' ? 'replied on your post' : 'started following you'
+  const label = (n: NotificationT) => n.type === 'like' ? 'liked your post' : n.type === 'comment' ? 'commented on your post' : n.type === 'reply' ? 'replied to your comment' : 'started following you'
   const icon = (n: NotificationT) => n.type === 'like' ? '❤️' : n.type === 'comment' ? '💬' : n.type === 'reply' ? '↩️' : '➕'
   const target = (n: NotificationT) => goProfile(n.type === 'follow' ? n.actor.username : me.username)
 
@@ -446,13 +453,14 @@ function Notifications({ me, goProfile, refreshKey }: { me: User; goProfile: (u:
       {error && <div className="error">{error}</div>}
       {loading ? <div className="empty">Loading…</div> : items.length === 0 ? <div className="empty">Nothing yet — likes, comments and new followers will land here.</div> :
         items.map((n) => (
-          <div key={n.id} className="notifrow" onClick={() => target(n)}>
+          <div key={n.id} className={`notifrow ${n.createdAt > prevSeen ? 'unread' : ''}`} onClick={() => target(n)}>
             <span style={{ fontSize: 18 }}>{icon(n)}</span>
             <div className="grow">
               <span className="username">@{n.actor.username}</span>{n.actor.isAgent && <span className="agent">AI</span>} <span>{label(n)}</span>
               {n.postText && <div className="meta" style={{ whiteSpace: 'pre-wrap' }}>“{n.postText}”</div>}
             </div>
             <span className="meta">{fmt(n.createdAt)}</span>
+            {n.createdAt > prevSeen && <span className="unreaddot" aria-label="Unread" />}
           </div>
         ))}
     </div>
@@ -460,6 +468,26 @@ function Notifications({ me, goProfile, refreshKey }: { me: User; goProfile: (u:
 }
 
 /* ---------------- Messages ---------------- */
+// Coloured initial-avatar: initials on a gradient derived from the username,
+// so every conversation is recognisable without profile photos.
+function Avatar({ name, size = 40 }: { name: string; size?: number }) {
+  const h = [...name].reduce((s, ch) => s + ch.charCodeAt(0), 0)
+  return (
+    <span className="avatar" aria-hidden="true" style={{ width: size, height: size, fontSize: Math.round(size * 0.4), background: `linear-gradient(135deg, hsl(${h % 360} 55% 42%), hsl(${(h * 7) % 360} 60% 55%))` }}>
+      {name.replace(/^@/, '').slice(0, 2).toUpperCase()}
+    </span>
+  )
+}
+
+const ago = (iso: string) => {
+  const s = Math.max(1, Math.floor((Date.now() - new Date(iso).getTime()) / 1000))
+  if (s < 60) return 'now'
+  const m = Math.floor(s / 60); if (m < 60) return `${m}m`
+  const hr = Math.floor(m / 60); if (hr < 24) return `${hr}h`
+  const d = Math.floor(hr / 24); if (d < 7) return `${d}d`
+  return fmt(iso)
+}
+
 function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: string) => void; refreshKey: number }) {
   const [convs, setConvs] = useState<Conversation[]>([])
   const [activeId, setActiveId] = useState<string | null>(sessionStorage.getItem('musetalk_open_conv'))
@@ -471,7 +499,9 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
   const [newUser, setNewUser] = useState('')
   const [groupName, setGroupName] = useState('')
   const [groupMembers, setGroupMembers] = useState('')
+  const [filter, setFilter] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
+  const stickingRef = useRef(true) // auto-scroll only while the reader is at/near the bottom
 
   const loadConvs = useCallback(() => { api<{ conversations: Conversation[] }>('/conversations').then((r) => setConvs(r.conversations)).catch(() => {}) }, [])
   const loadMsgs = useCallback(() => {
@@ -485,10 +515,17 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
   useEffect(() => { loadConvs(); const t = setInterval(loadConvs, 5000); return () => clearInterval(t) }, [loadConvs])
   useEffect(() => { loadMsgs(); const t = setInterval(loadMsgs, 2500); return () => clearInterval(t) }, [loadMsgs]) // near-real-time: no manual refresh needed
   useEffect(() => { loadConvs(); loadMsgs() }, [refreshKey, loadConvs, loadMsgs])
-  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [messages.length, activeId])
+  // Opening a conversation starts at the newest message…
+  useEffect(() => { stickingRef.current = true; scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [activeId])
+  // …but new arrivals only pull the view down while the reader is already at
+  // the bottom — scrolling up to read history is never interrupted.
+  useEffect(() => { if (stickingRef.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }) }, [messages])
+  const onScrollMsgs = () => { const el = scrollRef.current; if (el) stickingRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120 }
 
   const active = convs.find((c) => c.id === activeId)
-  const title = (c: Conversation) => c.isGroup ? `👥 ${c.name}` : `@${c.participants.find((p) => p.id !== me.id)?.username ?? 'chat'}`
+  const otherOf = (c: Conversation) => c.participants.find((p) => p.id !== me.id)
+  const title = (c: Conversation) => c.isGroup ? `👥 ${c.name}` : `@${otherOf(c)?.username ?? 'chat'}`
+  const shownConvs = filter.trim() ? convs.filter((c) => title(c).toLowerCase().includes(filter.trim().toLowerCase())) : convs
 
   const send = async () => {
     if (!activeId || !draft.trim()) return
@@ -501,8 +538,23 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
 
   const loadOlder = async () => {
     if (!activeId || !messages.length) return
+    const el = scrollRef.current
+    const prevHeight = el?.scrollHeight ?? 0
     const r = await api<{ messages: Message[] }>(`/conversations/${activeId}/messages?before=${encodeURIComponent(messages[0].created_at)}`)
+    if (!r.messages.length) return
+    stickingRef.current = false
     setMessages((prev) => [...r.messages, ...prev])
+    // Keep the reader's place: the view stays on the same message, not the bottom.
+    requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - prevHeight })
+  }
+
+  const delMsg = async (m: Message) => {
+    if (!activeId) return
+    if (!confirm('Delete this message? It will disappear for everyone in this conversation.')) return
+    try {
+      await api(`/conversations/${activeId}/messages/${m.id}`, { method: 'DELETE' })
+      setMessages((prev) => prev.filter((x) => x.id !== m.id)); loadConvs()
+    } catch (e) { setError(e instanceof Error ? e.message : 'Could not delete the message.') }
   }
 
   const startDm = async () => {
@@ -518,15 +570,23 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
   }
 
   return (
-    <div className="chatlayout">
+    <div className={`chatlayout ${activeId ? 'has-active' : ''}`}>
       <div className="card">
-        <h3 style={{ marginTop: 0 }}>Conversations</h3>
+        <h3 style={{ marginTop: 0 }}>Messages</h3>
         {error && <div className="error">{error}</div>}
+        {convs.length > 3 && <input className="inboxfilter" placeholder="Search conversations…" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Search conversations" />}
         {convs.length === 0 && <div className="empty">No conversations yet. Start one below.</div>}
-        {convs.map((c) => (
+        {convs.length > 0 && shownConvs.length === 0 && <div className="empty">No conversation matches “{filter}”.</div>}
+        {shownConvs.map((c) => (
           <div key={c.id} className={`conv ${c.id === activeId ? 'active' : ''}`} onClick={() => { setActiveId(c.id); sessionStorage.setItem('musetalk_open_conv', c.id) }}>
-            <div className="row"><b className="grow">{title(c)}</b>{c.unread > 0 && <span className="badge">{c.unread} new</span>}</div>
-            <div className="small">{c.lastMessage ? `${c.lastMessage.text.slice(0, 46)} · ${fmt(c.lastMessage.created_at)}` : 'No messages yet'}</div>
+            <div className="row" style={{ alignItems: 'flex-start' }}>
+              <Avatar name={c.isGroup ? (c.name ?? 'G') : (otherOf(c)?.username ?? '?')} size={42} />
+              <div className="grow" style={{ minWidth: 0 }}>
+                <div className="row"><b className="grow convtitle">{title(c)}</b><span className="meta">{c.lastMessage ? ago(c.lastMessage.created_at) : ''}</span></div>
+                <div className={`small convpreview ${c.unread > 0 ? 'unread' : ''}`}>{c.lastMessage ? `${c.lastMessage.sender_id === me.id ? 'You: ' : ''}${c.lastMessage.text}` : 'No messages yet'}</div>
+              </div>
+              {c.unread > 0 && <span className="badge" aria-label={`${c.unread} unread messages`}>{c.unread}</span>}
+            </div>
           </div>
         ))}
         <h4>Start a DM</h4>
@@ -538,24 +598,34 @@ function Messages({ me, goProfile, refreshKey }: { me: User; goProfile: (u: stri
       </div>
       <div className="card">
         {!active ? <div className="empty">Pick a conversation on the left, or start a new one.</div> : <>
-          <h3 style={{ marginTop: 0 }}>{title(active)}</h3>
-          <p className="small" style={{ marginTop: -8 }}>
-            {active.participants.map((p) => <span key={p.id}> <span className={`dot ${isOnline(p.lastSeenAt) ? 'on' : ''}`} /><span className="username" onClick={() => goProfile(p.username)}>@{p.username}</span></span>)}
-          </p>
+          <div className="chathead">
+            <button className="backbtn" aria-label="Back to conversations" onClick={() => { setActiveId(null); sessionStorage.removeItem('musetalk_open_conv') }}>←</button>
+            <Avatar name={active.isGroup ? (active.name ?? 'G') : (otherOf(active)?.username ?? '?')} size={38} />
+            <div className="grow" style={{ minWidth: 0 }}>
+              <b>{title(active)}</b>
+              <div className="small">{active.isGroup ? `${active.participants.length} members` : isOnline(otherOf(active)?.lastSeenAt ?? '') ? 'Online now' : 'Offline'}</div>
+            </div>
+          </div>
+          {active.isGroup && (
+            <p className="small">
+              {active.participants.map((p) => <span key={p.id}> <span className={`dot ${isOnline(p.lastSeenAt) ? 'on' : ''}`} /><span className="username" onClick={() => goProfile(p.username)}>@{p.username}</span></span>)}
+            </p>
+          )}
           <button onClick={loadOlder}>Load older messages</button>
-          <div className="messages" ref={scrollRef}>
+          <div className="messages" ref={scrollRef} onScroll={onScrollMsgs}>
             {messages.length === 0 ? <div className="empty">No messages yet. Say hello 👋</div> :
               messages.map((m) => (
                 <div key={m.id} className={`bubble ${m.sender.id === me.id ? 'mine' : ''}`}>
                   {active.isGroup && m.sender.id !== me.id && <div className="meta">@{m.sender.username}</div>}
                   <div>{m.text}</div>
                   <div className="meta" style={{ fontSize: 11, marginTop: 3 }}>{fmt(m.created_at)}</div>
+                  {m.sender.id === me.id && <button className="msgdel" title="Delete this message for everyone" aria-label="Delete this message" onClick={() => delMsg(m)}>🗑 Delete</button>}
                 </div>
               ))}
           </div>
           {failed && <div className="error">Message failed to send — your text is still in the box. <button onClick={send}>Retry</button></div>}
           <div className="sendrow">
-            <textarea placeholder="Type a text message…" maxLength={LIMITS.message} value={draft} onChange={(e) => setDraft(e.target.value)}
+            <textarea placeholder="Type a text message…" maxLength={LIMITS.message} value={draft} onChange={(e) => setDraft(e.target.value)} aria-label="Message text"
               onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} />
             <button className="primary" disabled={sending} onClick={send}>{sending ? 'Sending…' : 'Send'}</button>
           </div>
@@ -570,7 +640,12 @@ function Settings({ me, setMe }: { me: User; setMe: (u: User) => void }) {
   const [bio, setBio] = useState(me.bio)
   const [notice, setNotice] = useState('')
   const [archive, setArchive] = useState<{ driveConfigured: boolean; pending: number; archived: number } | null>(null)
-  useEffect(() => { api<typeof archive>('/archive-status').then(setArchive).catch(() => {}) }, [])
+  // Google Drive archive details are owner-only. The server enforces this on
+  // /archive-status (403 for everyone else); the section is also only
+  // rendered — and the endpoint only called — for the owner accounts.
+  const ARCHIVE_VIEWERS = ['Muse001', 'muse_agent', 'MuseTalk']
+  const canSeeArchive = ARCHIVE_VIEWERS.some((u) => u.toLowerCase() === me.username.toLowerCase())
+  useEffect(() => { if (canSeeArchive) api<typeof archive>('/archive-status').then(setArchive).catch(() => {}) }, [canSeeArchive])
   return (
     <div className="card">
       <h2 style={{ marginTop: 0 }}>Settings</h2>
@@ -579,10 +654,12 @@ function Settings({ me, setMe }: { me: User; setMe: (u: User) => void }) {
       <textarea rows={2} maxLength={LIMITS.bio} value={bio} onChange={(e) => setBio(e.target.value)} />
       <button className="primary" style={{ marginTop: 10 }} onClick={async () => { const r = await api<{ user: User }>('/me', { method: 'PATCH', body: { bio } }); setMe(r.user); setNotice('Bio saved.') }}>Save bio</button>
       {notice && <div className="notice">{notice}</div>}
-      <h3>Message archive (Google Drive)</h3>
-      {archive === null ? <p className="small">Checking archive status…</p> : archive.driveConfigured
-        ? <p className="small">✅ Drive archive is connected. {archive.archived} message(s) archived, {archive.pending} waiting in the sync queue (the queue retries automatically — nothing is lost during an outage).</p>
-        : <p className="small">⚠️ Drive archive is not connected yet by the site owner. Messages are stored safely in the live database and queue, and will be archived as soon as the owner connects Google Drive (README, step 2).</p>}
+      {canSeeArchive && <>
+        <h3>Message archive (Google Drive)</h3>
+        {archive === null ? <p className="small">Checking archive status…</p> : archive.driveConfigured
+          ? <p className="small">✅ Drive archive is connected. {archive.archived} message(s) archived, {archive.pending} waiting in the sync queue (the queue retries automatically — nothing is lost during an outage).</p>
+          : <p className="small">⚠️ Drive archive is not connected yet by the site owner. Messages are stored safely in the live database and queue, and will be archived as soon as the owner connects Google Drive (README, step 2).</p>}
+      </>}
       <h3>Privacy</h3>
       <p className="small">MuseTalk collects only your username and a securely hashed password — no email, phone or real name. Messages are <b>not</b> end-to-end encrypted; they are protected by account login and server-side access checks. Blocking a user from their profile hides you from each other and removes follows both ways.</p>
       <h3>AI agents</h3>

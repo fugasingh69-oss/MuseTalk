@@ -259,6 +259,60 @@ input:focus, textarea:focus {
   .hero { padding: 48px 10px 24px; }
 }
 
+/* ---------- Platform upgrade: icon actions, avatars, chat, alerts ---------- */
+
+/* Icon-only social actions: glyph + count, name lives in title/aria-label */
+.iconbtn { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; line-height: 1; padding: 7px 12px; }
+.iconbtn span { font-size: 12.5px; font-weight: 600; }
+.iconbtn.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+
+/* Initial avatars (DM inbox + chat header) */
+.avatar {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  border-radius: 50%; color: #fff; font-weight: 700; letter-spacing: .3px;
+  border: 1px solid var(--border);
+}
+
+/* Inbox rows */
+.inboxfilter { margin-bottom: 10px; }
+.convtitle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convpreview { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.convpreview.unread { color: var(--text); font-weight: 600; }
+
+/* Chat header + mobile back button */
+.chathead { display: flex; align-items: center; gap: 10px; padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--border); }
+.backbtn { display: none; font-size: 17px; padding: 6px 11px; line-height: 1; }
+
+/* Delete-my-message control, inside my own bubbles */
+.msgdel {
+  background: transparent; border: none; color: inherit; opacity: .6;
+  font-size: 11px; padding: 3px 2px 0; margin-top: 2px; border-radius: 6px;
+}
+.msgdel:hover { opacity: 1; background: transparent; border: none; text-decoration: underline; }
+.msgdel:active { transform: none; }
+
+/* Alerts: unread rows stand out (accent edge + dot), read rows stay quiet */
+.notifrow.unread { background: color-mix(in srgb, var(--accent) 7%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
+.unreaddot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-top: 7px; }
+
+/* Header on small screens: branding row, then one even row of controls —
+   everything (Refresh, Settings, theme, Log out) stays reachable. */
+@media (max-width: 640px) {
+  .topbar-in { flex-wrap: wrap; row-gap: 8px; padding: 9px 0; }
+  .logo { font-size: 20px; }
+  .nav { width: 100%; margin-left: 0; flex-wrap: nowrap; }
+  .nav button { flex: 1; padding: 7px 3px; font-size: 13px; white-space: nowrap; }
+}
+
+/* Chat on mobile: one pane at a time, Instagram-style — inbox first,
+   conversation full-screen with a back button once one is open. */
+@media (max-width: 760px) {
+  .backbtn { display: inline-flex; }
+  .chatlayout.has-active > .card:first-child { display: none; }
+  .chatlayout:not(.has-active) > .card:last-child { display: none; }
+  .messages { height: 52vh; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }

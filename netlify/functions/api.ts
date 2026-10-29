@@ -263,29 +263,50 @@ async function searchPosts(me: string, query: string) {
 }
 
 // Notifications are derived live from likes / comments / follows on your own
-// activity — no separate table, nothing extra to maintain or lose.
+// activity — no separate table, nothing extra to maintain or lose. Because
+// they are derived, a retried request can never create a duplicate, and the
+// recipient is always the owner of the post / comment / account involved.
+// Self-actions are excluded in every query (actor ≠ recipient).
 async function notifications(me: string) {
   const supa = db()
   const hidden = await blockedIds(me)
   type Notif = { id: string; type: string; actor: { id: string; username: string; isAgent: boolean }; postId?: string; postText?: string; createdAt: string }
   const out: Notif[] = []
-  const [likesR, commentsR, followsR] = await Promise.all([
+  // Replies to MY comments can land on anyone's post, so they need their own
+  // lookup (parent comment is mine) — the on-my-posts query below can't see
+  // them. The two sources overlap when someone replies to my comment on my
+  // own post, so results are de-duplicated by comment id.
+  const { data: myCommentRows } = await supa.from('comments').select('id').eq('author_id', me).order('created_at', { ascending: false }).limit(100)
+  const myCommentIds = (myCommentRows ?? []).map((c) => c.id as string)
+  const [likesR, commentsR, followsR, repliesR] = await Promise.all([
     supa.from('likes').select('created_at, post_id, user:users!likes_user_id_fkey(id, username, is_agent), post:posts!likes_post_id_fkey!inner(text, author_id)')
       .eq('post.author_id', me).neq('user_id', me).order('created_at', { ascending: false }).limit(30),
-    supa.from('comments').select('created_at, post_id, parent_id, author:users!comments_author_id_fkey(id, username, is_agent), post:posts!comments_post_id_fkey!inner(text, author_id)')
+    supa.from('comments').select('id, created_at, post_id, parent_id, author:users!comments_author_id_fkey(id, username, is_agent), post:posts!comments_post_id_fkey!inner(text, author_id)')
       .eq('post.author_id', me).neq('author_id', me).order('created_at', { ascending: false }).limit(30),
     supa.from('follows').select('created_at, follower:users!follows_follower_id_fkey(id, username, is_agent)')
       .eq('following_id', me).order('created_at', { ascending: false }).limit(30),
+    myCommentIds.length
+      ? supa.from('comments').select('id, created_at, post_id, parent_id, author:users!comments_author_id_fkey(id, username, is_agent), post:posts!comments_post_id_fkey!inner(text, author_id)')
+          .in('parent_id', myCommentIds).neq('author_id', me).order('created_at', { ascending: false }).limit(30)
+      : Promise.resolve({ data: [] as Record<string, unknown>[] }),
   ])
   for (const l of likesR.data ?? []) {
     const r = l as PostRow; const actor = pubAuthor(r.user)
     if (hidden.includes(actor.id as string)) continue
     out.push({ id: `like-${r.post_id}-${actor.id}`, type: 'like', actor, postId: r.post_id as string, postText: excerpt((r.post as { text: string }).text), createdAt: r.created_at as string })
   }
+  const seenCommentIds = new Set<string>()
   for (const c of commentsR.data ?? []) {
     const r = c as PostRow; const actor = pubAuthor(r.author)
     if (hidden.includes(actor.id as string)) continue
-    out.push({ id: `comment-${r.post_id}-${r.created_at}`, type: r.parent_id ? 'reply' : 'comment', actor, postId: r.post_id as string, postText: excerpt((r.post as { text: string }).text), createdAt: r.created_at as string })
+    seenCommentIds.add(r.id as string)
+    out.push({ id: `comment-${r.id}`, type: r.parent_id ? 'reply' : 'comment', actor, postId: r.post_id as string, postText: excerpt((r.post as { text: string }).text), createdAt: r.created_at as string })
+  }
+  for (const c of repliesR.data ?? []) {
+    const r = c as PostRow; const actor = pubAuthor(r.author)
+    if (hidden.includes(actor.id as string)) continue
+    if (seenCommentIds.has(r.id as string)) continue // already reported via the on-my-posts query
+    out.push({ id: `comment-${r.id}`, type: 'reply', actor, postId: r.post_id as string, postText: excerpt((r.post as { text: string }).text), createdAt: r.created_at as string })
   }
   for (const f of followsR.data ?? []) {
     const r = f as PostRow; const actor = pubAuthor(r.follower)
@@ -477,7 +498,7 @@ async function listConversations(me: string) {
   const [{ data: convs }, { data: allParts }, { data: recent }] = await Promise.all([
     supa.from('conversations').select('*').in('id', ids),
     supa.from('conversation_participants').select('conversation_id, user:users!conversation_participants_user_id_fkey(id, username, is_agent, last_seen_at)').in('conversation_id', ids),
-    supa.from('messages').select('conversation_id, text, created_at, sender_id').in('conversation_id', ids).order('created_at', { ascending: false }).limit(500),
+    supa.from('messages').select('conversation_id, text, created_at, sender_id').in('conversation_id', ids).is('deleted_at', null).order('created_at', { ascending: false }).limit(500),
   ])
   const lastByConv = new Map<string, Record<string, unknown>>()
   for (const m of recent ?? []) if (!lastByConv.has(m.conversation_id)) lastByConv.set(m.conversation_id, m)
@@ -491,7 +512,8 @@ async function listConversations(me: string) {
       lastMessage: lastByConv.get(c.id) ?? null, unread,
     })
   }
-  out.sort((a, b) => String(b.lastMessage?.createdAt ?? b.createdAt).localeCompare(String(a.lastMessage?.createdAt ?? a.createdAt)))
+  // Sort by the last message's time (rows carry created_at), newest first.
+  out.sort((a, b) => String((b.lastMessage as { created_at?: string } | null)?.created_at ?? b.createdAt).localeCompare(String((a.lastMessage as { created_at?: string } | null)?.created_at ?? a.createdAt)))
   return json(200, { conversations: out })
 }
 
@@ -536,7 +558,7 @@ async function createConversation(event: Event, me: string) {
 async function listMessages(me: string, conversationId: string, before?: string) {
   await assertParticipant(me, conversationId)
   let q = db().from('messages').select('id, text, created_at, sender:users!messages_sender_id_fkey(id, username, is_agent)')
-    .eq('conversation_id', conversationId).order('created_at', { ascending: false }).limit(50)
+    .eq('conversation_id', conversationId).is('deleted_at', null).order('created_at', { ascending: false }).limit(50)
   if (before) q = q.lt('created_at', before) // pagination for older messages
   const { data } = await q
   return json(200, { messages: (data ?? []).reverse() })
@@ -557,6 +579,25 @@ async function sendMessage(event: Event, me: string, conversationId: string) {
   await supa.from('drive_sync_queue').insert({ message_id: data.id })
   await supa.from('conversation_participants').update({ last_read_at: new Date().toISOString() }).eq('conversation_id', conversationId).eq('user_id', me)
   return json(201, { message: data })
+}
+
+// Delete one of MY OWN messages. Soft delete: the row is stamped with
+// deleted_at and disappears from the app for ALL participants at once.
+// Ownership is enforced here on the server — the message's sender_id must
+// equal the authenticated user's id, whatever the request claims. A message
+// that has not reached Google Drive yet is also dropped from the sync queue,
+// so it never gets archived after being deleted.
+async function deleteMessage(me: string, conversationId: string, messageId: string) {
+  await assertParticipant(me, conversationId)
+  const supa = db()
+  const { data: msg } = await supa.from('messages').select('id, sender_id, deleted_at')
+    .eq('id', messageId).eq('conversation_id', conversationId).maybeSingle()
+  if (!msg || msg.deleted_at) throw new HttpError(404, 'Message not found.')
+  if (msg.sender_id !== me) throw new HttpError(403, 'You can only delete your own messages.')
+  const { error } = await supa.from('messages').update({ deleted_at: new Date().toISOString() }).eq('id', messageId)
+  if (error) throw new HttpError(500, 'Could not delete the message.')
+  await supa.from('drive_sync_queue').delete().eq('message_id', messageId).is('synced_at', null)
+  return json(200, { ok: true, deleted: true })
 }
 
 async function markRead(me: string, conversationId: string) {
@@ -615,9 +656,18 @@ export async function handler(event: Event) {
     if (method === 'POST' && seg[0] === 'conversations' && seg.length === 1) return await createConversation(event, me.id)
     if (method === 'GET' && seg[0] === 'conversations' && seg[2] === 'messages') return await listMessages(me.id, seg[1], event.queryStringParameters?.before ?? undefined)
     if (method === 'POST' && seg[0] === 'conversations' && seg[2] === 'messages') return await sendMessage(event, me.id, seg[1])
+    if (method === 'DELETE' && seg[0] === 'conversations' && seg[2] === 'messages' && seg.length === 4) return await deleteMessage(me.id, seg[1], seg[3])
     if (method === 'POST' && seg[0] === 'conversations' && seg[2] === 'read') return await markRead(me.id, seg[1])
 
     if (method === 'GET' && seg[0] === 'archive-status') {
+      // Archive information is owner-only. The check uses the authenticated
+      // identity from the verified token (never a client-supplied name):
+      // only the owner's accounts may see archive status or counts.
+      const ARCHIVE_VIEWERS = ['muse001', 'muse_agent', 'musetalk']
+      const { data: meRow } = await supa.from('users').select('username_lower').eq('id', me.id).maybeSingle()
+      if (!meRow || !ARCHIVE_VIEWERS.includes(meRow.username_lower as string)) {
+        throw new HttpError(403, 'Archive information is restricted to the site owner accounts.')
+      }
       const [{ count: pending }, { count: synced }] = await Promise.all([
         supa.from('drive_sync_queue').select('*', { count: 'exact', head: true }).is('synced_at', null),
         supa.from('drive_sync_queue').select('*', { count: 'exact', head: true }).not('synced_at', 'is', null),
